@@ -1,4 +1,33 @@
-# Screen View bundle layer: register the desktop screenshot and window-list tools.
+# 桌面操控 (Desktop Control) bundle layer: register the desktop tools.
+#
+# 这里写的是**部署默认值**。在插件页里改的值会落到本插件自己的状态文件
+# （$DSH_HOME/state/dsh-bundle-screen-view/settings.json），作为稀疏覆盖层，
+# 立即生效、无需重启。想改部署默认值，就改这里，然后重启 DSH。
 - insert:
     - id: screen-view
       name: 'dsh-bundle-screen-view'
+      config:
+        # 总开关：关闭后一个工具都不注册（面板仍可打开）。
+        enabled: true
+
+        # 只读组：window_list（列窗口）+ screenshot（截图）。
+        # 它们不会移动鼠标或按键，但会把屏幕内容交给模型 —— 涉密屏幕上建议关掉。
+        allowCapture: true
+
+        # 输入组：window_activate / mouse_click / type_text / key / scroll。
+        # 这五个会**真的**移动光标、按键、打字。插件没有「确认后执行」机制，
+        # 权限允许时不会弹窗征求同意 —— 只想让智能体「看」就把它设为 false。
+        allowInput: true
+
+        # 截图默认最大宽度（像素，320–8192）；超出等比缩小。
+        # 模型仍可在单次调用里用 maxWidth 参数临时覆盖。
+        captureMaxWidth: 2560
+
+        # 图片引用 LRU 上限（4–512）：render() 靠它把像素回传给模型。
+        # 太小会导致较早的截图无法回传给模型。
+        imageCacheSize: 64
+
+        # 排除的窗口标题（YAML 列表或逗号分隔字符串，大小写不敏感）。
+        # 命中的窗口不会出现在 window_list 里，也不能被截图或操作 ——
+        # 用来挡住密码管理器、网银这类窗口。留空则不排除。
+        excludeWindowTitles: []

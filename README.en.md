@@ -1,9 +1,13 @@
-# Screen View · dsh-bundle-screen-view
+# Desktop Control · dsh-bundle-screen-view
 
-A [DeepSeek Harness](https://github.com/OraSkyC/dsh-bundle-screen-view) (DSH) plugin that gives the
-agent **eyes and hands**: capture the local desktop, list windows, and drive the real mouse and keyboard.
+A [DeepSeek Harness](https://github.com/OraSkyC/dsh-bundle-screen-view) (DSH) plugin that lets the
+agent **see and operate your real desktop**: capture the screen, list windows, and drive the mouse
+and keyboard.
 
 > English · [简体中文](README.md)
+
+> **On the name**: this plugin used to be called "Screen View", but that only described the *seeing*
+> half. Five of its tools actually *act*, so it is now called **Desktop Control**.
 
 ---
 
@@ -25,6 +29,10 @@ Before installing, make sure that:
 - you accept that the agent may call these during a session (this depends on your permission preset —
   see "Reducing the risk" below);
 - you do not hand a session with these tools to an untrusted prompt or untrusted page content.
+
+**The plugin itself has no confirmation step** — it will not ask before acting. It does, however,
+provide three **safety gates that take effect immediately** (see "Settings" below). The most
+important one lets you keep the *seeing* and drop the *acting*.
 
 ## What it does
 
@@ -68,6 +76,40 @@ dsh plugin --profile desktop add https://github.com/OraSkyC/dsh-bundle-screen-vi
 
 **Restart DSH** afterwards.
 
+## Settings
+
+**Settings → Plugins → Desktop Control.** Changes take effect **immediately, with no restart** —
+turning the input group off makes those five tools disappear from the session on the spot.
+
+Two layers, lowest priority first:
+
+| Layer | Location | Takes effect |
+| --- | --- | --- |
+| Deploy defaults | [`cordis.patch.yml`](./cordis.patch.yml) in this package | after a **DSH restart** |
+| User overrides | `%USERPROFILE%\.dsh\state\dsh-bundle-screen-view\settings.json` | **immediately** |
+
+The user layer is **sparse**: it only stores what you actually changed. "Reset" **deletes** the key
+rather than writing the default back, so the field falls through to the deploy defaults again.
+
+### Safety gates
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `enabled` | `true` | Master switch. When off, **no tools are registered at all**; the panel still opens. |
+| `allowCapture` | `true` | Registers `window_list` + `screenshot`. They never touch your mouse, but they do hand screen contents to the model — turn this off on sensitive screens. |
+| `allowInput` | `true` | Registers `window_activate` / `mouse_click` / `type_text` / `key` / `scroll`. **Turn this off to let the agent look but not touch.** |
+
+### Behaviour
+
+| Key | Default | Range | Meaning |
+| --- | --- | --- | --- |
+| `captureMaxWidth` | `2560` | 320–8192 | Default max capture width; wider captures are downscaled. The model can still override per call with `maxWidth`. |
+| `imageCacheSize` | `64` | 4–512 | How many screenshot references to keep. Too small and older screenshots cannot be handed back to the model. |
+| `excludeWindowTitles` | `[]` | — | Comma separated, case-insensitive. Matching windows **are hidden from `window_list` and cannot be captured or operated** — use it to keep password managers and banking windows out. |
+
+`excludeWindowTitles` is the one privacy-oriented setting, and it applies on **both paths** (listing
+and acting), so an excluded window cannot leak through the other entry point.
+
 ## Requirements
 
 | Item | Requirement |
@@ -78,22 +120,26 @@ dsh plugin --profile desktop add https://github.com/OraSkyC/dsh-bundle-screen-vi
 | npm dependencies | **none** — see "Where koffi comes from" |
 | Build step | **none** |
 
-The plugin depends only on the Host's `tools` and `attachments` services
-(`inject = ['tools', 'attachments']`). It has no browser half, so **no settings card appears in the
-Plugins page** — it is pure Host capability: install it and the tools exist.
+The plugin depends on the Host's `tools`, `attachments` and `webServer` services
+(`inject = ['tools', 'attachments', 'webServer']`). `webServer` is a **hard** dependency: Cordis's
+`ctx` is a restricted proxy, so reading a property that was not declared in `inject` **throws**
+rather than returning `undefined`. Missing it fails the whole `apply()` and the plugin shows as
+"error" in the Plugins page.
 
 ## Reducing the risk
 
-The plugin has no on/off switch of its own, but there are three existing layers of control:
+There are now four layers of control:
 
-1. **Permission presets** — DSH's presets (`read-only` / `workspace-write` / `danger-full-access`)
-   decide what a session may do; this is the main gate.
-2. **Not installed means not present** — the tools only exist while the plugin is loaded. Uninstall
+1. **The plugin's own safety gates** (recommended): turn `allowInput` off in the Plugins page and the
+   agent is left with seeing only. This is the most direct layer, and it needs no restart.
+2. **Permission presets** — DSH's presets (`read-only` / `workspace-write` / `danger-full-access`)
+   decide what a session may do.
+3. **Not installed means not present** — the tools only exist while the plugin is loaded. Uninstall
    or disable it once your automation is done.
-3. **Prompt level** — the tool descriptions state "use it only when the user asked you to operate the
+4. **Prompt level** — the tool descriptions state "use it only when the user asked you to operate the
    UI, and prefer targeting one specific window". That constrains the model; it is not enforcement.
 
-**Note: this plugin implements no confirmation step.** Once the tools are available and permissions
+**Remember that the plugin has no confirmation step.** Once the tools are available and permissions
 allow it, an agent calling `mouse_click` will not pop up a dialog asking you first.
 
 ## Implementation notes
@@ -142,9 +188,10 @@ pixels — avoiding repeated copies of large images in memory.
 
 ```
 dsh-bundle-screen-view/
-├── package.json         # manifest: dsh.bundle.patch / files / os: win32
-├── cordis.patch.yml     # registers the entry (id: screen-view)
-├── index.js             # the seven tools: registration, validation, rendering
+├── package.json         # manifest: dsh.bundle.patch / dsh.client / files / os: win32
+├── cordis.patch.yml     # registers the entry (id: screen-view) + deploy default config
+├── index.js             # config contract, the seven tools and their gates, panel routes
+├── client.js            # browser half: the settings card (React injected by the loader)
 ├── lib/
 │   ├── capture.js       # GDI capture (BitBlt primary + PrintWindow fallback), window enumeration, koffi resolution
 │   ├── input.js         # SendInput synthesis (mouse / keyboard / wheel / activate)
@@ -155,16 +202,25 @@ dsh-bundle-screen-view/
 ├── README.md            # Chinese
 ├── README.en.md         # this file
 ├── CHANGELOG.md
-└── LICENSE
+├── LICENSE
+├── test-host.mjs        # host side: config, gates, routes, tool registration
+└── test-client.mjs      # browser side: registration, component rendering, CSS token validity
 ```
 
 ## Development
 
 ```bash
-npm run check     # syntax-check all four files
+npm run check     # syntax-check all five files
+npm test          # 27 host assertion groups + 20 client assertion groups
 ```
 
-There is no test suite — the behaviour of these tools can only be verified on a real desktop.
+The tests cover config normalisation, the three safety gates, window exclusion, the sparse override
+layer and the panel routes, plus panel rendering — including two regression classes that fail
+**silently** in a browser (**are the field labels visible**, and **do the CSS variables actually
+exist**) and therefore can only be caught by an assertion.
+
+What these tools do on a **real desktop** (is the capture correct, does the click land on the right
+coordinate) still has to be verified by hand.
 
 ## License
 

@@ -9,6 +9,48 @@
 
 ## [未发布]
 
+## [1.2.0] - 2026-10-08
+
+### 变更
+
+- **改名：「屏幕视野」→「桌面操控」。** 旧名字只描述了「看」这一半，但插件有 5 个工具在
+  「动手」（真的移动鼠标、按键、打字）。`displayName`、两个 locale 的 `meta.title`
+  与两份 README 的标题都已更新。`package.json` 的 `name`、entry id 与仓库地址**保持不变**，
+  以免破坏既有安装。
+
+### 新增
+
+- **插件页里的设置卡**（新增浏览器半侧 `client.js`，`package.json` 补 `dsh.client`）。
+  改动**立即生效，无需重启**。
+- **三道安全闸门**：
+  - `enabled` —— 总开关，关闭后一个工具都不注册。
+  - `allowCapture` —— 只读组（`window_list` + `screenshot`）。
+  - `allowInput` —— 输入组（`window_activate` / `mouse_click` / `type_text` / `key` / `scroll`）。
+    **只想让智能体「看」就关掉它**，那 5 个工具会当场从会话里消失。
+- **`excludeWindowTitles`** —— 标题命中的窗口不会出现在 `window_list` 里，
+  也不能被截图或操作。这是唯一一个隐私性质的设置，且刻意在**两条路径上都生效**，
+  避免被排除的窗口从另一个入口泄露出去。
+- **两个行为设置**：`captureMaxWidth`（截图默认最大宽度）与 `imageCacheSize`（图片引用 LRU 上限）。
+- 配置分层与 `dsh-bundle-default-workspace` 一致：`cordis.patch.yml` 写部署默认值，
+  用户覆盖落到 `$DSH_HOME/state/dsh-bundle-screen-view/settings.json` 的稀疏覆盖层。
+- 面板「状态」区回显平台、宿主 entry、**当前已注册的工具列表**与图片缓存占用；
+  `allowInput` 打开时显示醒目的风险提示，非 Windows 平台也会提示。
+
+### 修复
+
+- `inject` 补上 `webServer`。Cordis 的 `ctx` 是受限代理，读未声明在 `inject` 里的属性会
+  **抛错**而不是返回 `undefined` —— 漏声明会让整个 `apply()` 失败、插件在插件页显示「异常」。
+- `cordis.patch.yml` 的 `config` 段之前根本不存在，`apply(ctx)` 也从不读配置；
+  现在两者都补齐了。
+
+### 测试
+
+- 新增 `test-host.mjs`（27 项断言组）与 `test-client.mjs`（20 项断言组），`npm test` 可跑。
+- 覆盖：配置归一化与夹取、三道闸门的工具增减、**改闸门后工具立即重挂（无需重启）**、
+  窗口排除的大小写与空名单、稀疏覆盖层、面板路由的 403/405/400、
+  受限代理降级、以及面板组件的渲染。
+- 包含两条「界面不会报错」的回归：**字段标签必须可见**、**用到的 CSS 变量必须真实存在**。
+
 ## [1.1.0] - 2026-10-08
 
 首个公开发布版本。

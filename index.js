@@ -1,10 +1,18 @@
-// Screen View: desktop screenshot, window-list, and desktop input-control
-// tools for the DSH Host.
+// 桌面操控 (Desktop Control): desktop screenshot, window-list, and desktop
+// input-control tools for the DSH Host.
 //
 // Self-contained by design: no @deepseek-ai imports (a profile-installed
 // bundle resolves bare specifiers from the profile's node_modules, which does
 // not carry the Desktop installation's packages). Win32 capture and input go
 // through the koffi copy the Desktop host itself ships inside its asar tree.
+//
+// Configuration is two-layered, same shape as dsh-bundle-default-workspace:
+//   cordis.patch.yml config  →  deploy defaults (needs a DSH restart)
+//   $DSH_HOME/state/<pkg>/settings.json → sparse user overrides (immediate)
+import { readFile } from 'node:fs/promises';
+import { mkdir, writeFile } from 'node:fs/promises';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
 import {
 	capturePrimaryScreen,
 	captureWindow,
@@ -16,18 +24,164 @@ import {
 import { activateWindow, clickAt, pressKey, scrollAt, typeText } from './lib/input.js';
 import { encodePng } from './lib/png.js';
 
+/** Entry name: `cordis.patch.yml` inserts this row under this id. */
 const name = 'screen-view';
-const inject = ['tools', 'attachments'];
+/** Package name: the state directory and the panel routes are rooted at it. */
+const pkg = 'dsh-bundle-screen-view';
+/**
+ * 硬依赖声明。
+ *
+ * 关键：Cordis 的 ctx 是受限代理 —— 读一个没声明在 inject 里的属性会**抛错**
+ * （`cannot get property "webServer" without inject`），而不是返回 undefined。
+ * 面板路由要 webServer，漏声明会让整个 apply() 失败、插件在插件页显示「异常」。
+ */
+const inject = ['tools', 'attachments', 'webServer'];
+
+/* ------------------------------------------------------------------ */
+/* 配置契约                                                            */
+/* ------------------------------------------------------------------ */
+
+/**
+ * 每个字段的部署默认值；面板写入的覆盖层里缺省的字段回落到这里。
+ *
+ * 前三项是**安全闸门**，其余是行为调优：
+ *   enabled      总开关，关掉后一个工具都不注册
+ *   allowCapture 只读组：window_list + screenshot
+ *   allowInput   输入组：window_activate / mouse_click / type_text / key / scroll
+ */
+const DEFAULTS = {
+	enabled: true,
+	allowCapture: true,
+	allowInput: true,
+	/** 截图默认最大宽度（像素）；超出等比缩小。 */
+	captureMaxWidth: 2560,
+	/** 图片引用 LRU 上限：render() 靠它把像素交给模型。 */
+	imageCacheSize: 64,
+	/** 标题包含这些子串的窗口会被隐藏且不可被操作（隐私用，空数组 = 不限制）。 */
+	excludeWindowTitles: [],
+};
+
+const CAPTURE_WIDTH_MIN = 320;
+const CAPTURE_WIDTH_MAX = 8192;
+const IMAGE_CACHE_MIN = 4;
+const IMAGE_CACHE_MAX_LIMIT = 512;
+const EXCLUDE_MAX = 64;
+
+/** 只允许标题包含这些子串的窗口被操作（空数组 = 不限制）。 */
+const trimString = (value, fallback = '') => (typeof value === 'string' ? value.trim() : fallback);
+
+/**
+ * 归一化配置：默认值 → 部署配置 → 面板覆盖层，逐字段校验。
+ * 无效值就地回落，绝不抛错 —— 面板要能继续读，宿主不能因为一次误写崩掉。
+ * @param {object} raw - 合并后的原始配置。
+ * @returns {{settings: object, configError: string|null}}
+ */
+function resolveSettings(raw = {}) {
+	const source = { ...DEFAULTS, ...(raw && typeof raw === 'object' ? raw : {}) };
+	const out = {};
+	let configError = null;
+
+	out.enabled = typeof source.enabled === 'boolean' ? source.enabled : DEFAULTS.enabled;
+	out.allowCapture = typeof source.allowCapture === 'boolean' ? source.allowCapture : DEFAULTS.allowCapture;
+	out.allowInput = typeof source.allowInput === 'boolean' ? source.allowInput : DEFAULTS.allowInput;
+
+	const clampInt = (value, fallback, min, max) => {
+		const parsed = typeof value === 'number' && Number.isFinite(value) ? value : Number(value);
+		if (!Number.isFinite(parsed)) return fallback;
+		return Math.min(Math.max(Math.round(parsed), min), max);
+	};
+	out.captureMaxWidth = clampInt(source.captureMaxWidth, DEFAULTS.captureMaxWidth, CAPTURE_WIDTH_MIN, CAPTURE_WIDTH_MAX);
+	out.imageCacheSize = clampInt(source.imageCacheSize, DEFAULTS.imageCacheSize, IMAGE_CACHE_MIN, IMAGE_CACHE_MAX_LIMIT);
+
+	if (Array.isArray(source.excludeWindowTitles)) {
+		out.excludeWindowTitles = source.excludeWindowTitles
+			.map((entry) => trimString(entry))
+			.filter((entry) => entry !== '')
+			.slice(0, EXCLUDE_MAX);
+	} else if (typeof source.excludeWindowTitles === 'string') {
+		// 面板里是一个逗号分隔的输入框
+		out.excludeWindowTitles = source.excludeWindowTitles
+			.split(',')
+			.map((entry) => entry.trim())
+			.filter((entry) => entry !== '')
+			.slice(0, EXCLUDE_MAX);
+	} else {
+		out.excludeWindowTitles = [];
+	}
+
+	return { settings: out, configError };
+}
+
+/** 标题是否被排除名单命中（大小写不敏感）。 */
+function isExcludedTitle(title, excludeWindowTitles) {
+	if (!Array.isArray(excludeWindowTitles) || excludeWindowTitles.length === 0) return false;
+	const lowered = String(title ?? '').toLowerCase();
+	return excludeWindowTitles.some((needle) => lowered.includes(String(needle).toLowerCase()));
+}
+
+/** 状态目录：$DSH_HOME/state/<pkg>，与其它插件同级。 */
+function stateDirectory() {
+	const home = process.env.DSH_HOME && process.env.DSH_HOME.trim() !== ''
+		? process.env.DSH_HOME.trim()
+		: join(homedir(), '.dsh');
+	return join(home, 'state', pkg);
+}
+
+/**
+ * 稀疏覆盖层：只存用户显式改过的字段，缺省字段回落到部署配置。
+ * 读-改-写在同一条 promise 链上串行，两个并发改动不会互相覆盖。
+ */
+class FileStore {
+	constructor(location) {
+		this.location = location;
+		this.pending = Promise.resolve();
+		this.latest = null;
+	}
+	get file() {
+		return join(this.location.dir, this.location.file);
+	}
+	/** 读当前覆盖层；任何异常都回落为空对象，绝不抛。 */
+	read() {
+		const run = this.pending.then(async () => {
+			if (this.latest !== null) return this.latest;
+			const value = await this.readRaw();
+			this.latest = value;
+			return value;
+		});
+		this.pending = run.then(() => undefined, () => undefined);
+		return run;
+	}
+	async readRaw() {
+		try {
+			const parsed = JSON.parse(await readFile(this.file, 'utf8'));
+			return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
+		} catch {
+			return {};
+		}
+	}
+	mutate(mutator) {
+		const run = this.pending.then(async () => {
+			const current = this.latest ?? (await this.readRaw());
+			const next = mutator(current) ?? current;
+			await mkdir(this.location.dir, { recursive: true });
+			await writeFile(this.file, JSON.stringify(next, null, 2) + '\n', 'utf8');
+			this.latest = next;
+			return next;
+		});
+		this.pending = run.then(() => undefined, () => undefined);
+		return run;
+	}
+}
 
 /**
  * Recent image attachment refs, so render() can emit the ImageBlock that gets
- * the pixels to the model after execute() has committed them. Bounded LRU.
+ * the pixels to the model after execute() has committed them. Bounded LRU whose
+ * cap comes from the live settings.
  */
 const imageCache = new Map();
-const IMAGE_CACHE_MAX = 64;
 
-function rememberImage(ref) {
-	if (imageCache.size >= IMAGE_CACHE_MAX) {
+function rememberImage(ref, max) {
+	while (imageCache.size >= max) {
 		const oldest = imageCache.keys().next().value;
 		imageCache.delete(oldest);
 	}
@@ -47,14 +201,21 @@ const INPUT_NOTICE =
 	' This tool drives the real desktop — use it only when the user asked you to operate the UI, and prefer targeting one specific window.';
 
 /**
- * Register the desktop tools: two read-only (window_list, screenshot) and
- * five input-control (mouse_click, type_text, key, scroll, window_activate).
+ * Register the desktop tools the current settings allow: two read-only
+ * (window_list, screenshot) behind `allowCapture`, five input-control
+ * (window_activate, mouse_click, type_text, key, scroll) behind `allowInput`.
+ * apply() re-runs this whenever settings change, so a toggle takes effect
+ * immediately without a restart.
  * @param ctx - Agent-scoped registration context (tools, attachments).
- * @returns cleanup that unregisters the tools.
+ * @param wiring - the wiring record built by apply().
+ * @returns cleanup that unregisters everything registered this round.
  */
-function apply(ctx) {
+function registerTools(ctx, wiring) {
 	const unregisters = [];
-	unregisters.push(
+	const wantCapture = wiring.settings.allowCapture === true;
+	const wantInput = wiring.settings.allowInput === true;
+
+	if (wantCapture) unregisters.push(
 		ctx.tools.register({
 			name: 'window_list',
 			description:
@@ -78,11 +239,17 @@ function apply(ctx) {
 			timeoutMs: 15000,
 			execute() {
 				const api = getApi();
-				return Promise.resolve(listWindows(api));
+				// 排除名单同时作用于「列出」与「操作」两条路径，
+				// 否则被排除的窗口会从别的入口泄露出去。
+				return Promise.resolve(
+					listWindows(api).filter(
+						(w) => !isExcludedTitle(w.title, wiring.settings.excludeWindowTitles),
+					),
+				);
 			},
 		}),
 	);
-	unregisters.push(
+	if (wantCapture) unregisters.push(
 		ctx.tools.register({
 			name: 'screenshot',
 			description:
@@ -125,7 +292,9 @@ function apply(ctx) {
 			timeoutMs: 30000,
 			async execute(args) {
 				const needle = typeof args?.window === 'string' ? args.window.trim() : '';
-				const maxW = Number.isInteger(args?.maxWidth) && args.maxWidth >= 64 ? args.maxWidth : 2560;
+				const maxW = Number.isInteger(args?.maxWidth) && args.maxWidth >= 64
+					? args.maxWidth
+					: wiring.settings.captureMaxWidth;
 				const api = getApi();
 				let shot;
 				let title = '';
@@ -133,11 +302,17 @@ function apply(ctx) {
 					const win = findWindow(api, needle);
 					if (!win) {
 						const candidates = listWindows(api)
+							.filter((w) => !isExcludedTitle(w.title, wiring.settings.excludeWindowTitles))
 							.slice(0, 20)
 							.map((w) => `"${w.title}"`)
 							.join(', ');
 						throw new Error(
 							`No visible window whose title contains "${needle}". Visible windows: ${candidates || '(none)'}`,
+						);
+					}
+					if (isExcludedTitle(win.title, wiring.settings.excludeWindowTitles)) {
+						throw new Error(
+							`Window "${win.title}" is excluded by the excludeWindowTitles setting; remove it there to capture it.`,
 						);
 					}
 					title = win.title;
@@ -156,7 +331,7 @@ function apply(ctx) {
 					mediaType: 'image/png',
 					name: `${safeName ? safeName.replace(/ +/g, ' ') : 'screen'}-${Date.now()}.png`.slice(0, 200),
 				});
-				rememberImage(ref);
+				rememberImage(ref, wiring.settings.imageCacheSize);
 				return {
 					id: ref.attachmentId,
 					width: ref.width ?? shot.width,
@@ -167,7 +342,7 @@ function apply(ctx) {
 			},
 		}),
 	);
-	unregisters.push(
+	if (wantInput) unregisters.push(
 		ctx.tools.register({
 			name: 'window_activate',
 			description:
@@ -197,17 +372,23 @@ function apply(ctx) {
 				const win = findWindow(api, needle);
 				if (!win) {
 					const candidates = listWindows(api)
+						.filter((w) => !isExcludedTitle(w.title, wiring.settings.excludeWindowTitles))
 						.slice(0, 20)
 						.map((w) => `"${w.title}"`)
 						.join(', ');
 					throw new Error(`No visible window whose title contains "${needle}". Visible windows: ${candidates || '(none)'}`);
+				}
+				if (isExcludedTitle(win.title, wiring.settings.excludeWindowTitles)) {
+					throw new Error(
+						`Window "${win.title}" is excluded by the excludeWindowTitles setting; remove it there to operate it.`,
+					);
 				}
 				activateWindow(win.hwnd);
 				return { hwnd: win.hwnd, title: win.title };
 			},
 		}),
 	);
-	unregisters.push(
+	if (wantInput) unregisters.push(
 		ctx.tools.register({
 			name: 'mouse_click',
 			description:
@@ -251,7 +432,7 @@ function apply(ctx) {
 			},
 		}),
 	);
-	unregisters.push(
+	if (wantInput) unregisters.push(
 		ctx.tools.register({
 			name: 'type_text',
 			description:
@@ -285,7 +466,7 @@ function apply(ctx) {
 			},
 		}),
 	);
-	unregisters.push(
+	if (wantInput) unregisters.push(
 		ctx.tools.register({
 			name: 'key',
 			description:
@@ -313,7 +494,7 @@ function apply(ctx) {
 			},
 		}),
 	);
-	unregisters.push(
+	if (wantInput) unregisters.push(
 		ctx.tools.register({
 			name: 'scroll',
 			description:
@@ -361,11 +542,283 @@ function apply(ctx) {
 		}),
 	);
 	return () => {
-		imageCache.clear();
 		for (const unregister of unregisters) {
 			if (typeof unregister === 'function') unregister();
 		}
 	};
 }
 
-export { apply, inject, name };
+/* ------------------------------------------------------------------ */
+/* 面板 HTTP 路由                                                      */
+/* ------------------------------------------------------------------ */
+
+const STATE_PATH = `/api/${pkg}/state`;
+const SETTINGS_PATH = `/api/${pkg}/settings`;
+const NO_CACHE = { 'cache-control': 'no-store' };
+const MAX_BODY_BYTES = 8192;
+
+/** 默认允许的回环主机名。 */
+const LOOPBACK_HOSTS = ['localhost', '127.0.0.1', '::1'];
+
+/**
+ * Host 头里的裸主机名。裸 IPv6（两个及以上冒号）不按 host:port 剥端口，
+ * 否则 ::1 的尾段会被当成端口切掉。
+ */
+function bareHost(host) {
+	const text = String(host ?? '').split(',')[0]?.trim() ?? '';
+	if (text === '') return '';
+	const lower = text.toLowerCase();
+	const bracketed = /^\[([^\]]+)\](?::\d+)?$/.exec(lower);
+	if (bracketed) return bracketed[1];
+	if (/^[0-9a-f:]+$/.test(lower) && (lower.match(/:/g) ?? []).length >= 2) return lower;
+	return lower.replace(/:\d+$/, '');
+}
+
+/** 面板请求是否来自本机回环。只校验 Host：跨源请求到不了回环 webserver。 */
+function isAdmitted(request) {
+	const host = bareHost(request?.headers?.host);
+	if (host === '') return false;
+	return LOOPBACK_HOSTS.some((entry) => host === entry);
+}
+
+function writeJson(res, status, body) {
+	res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', ...NO_CACHE });
+	res.end(JSON.stringify(body));
+}
+
+async function readJsonBody(request, limit = MAX_BODY_BYTES) {
+	const chunks = [];
+	let received = 0;
+	try {
+		for await (const chunk of request) {
+			const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+			received += buffer.byteLength;
+			if (received > limit) return { ok: false, error: '请求体过大' };
+			chunks.push(buffer);
+		}
+	} catch {
+		return { ok: false, error: '无法读取请求体' };
+	}
+	if (chunks.length === 0) return { ok: false, error: '需要一个 JSON 请求体' };
+	try {
+		const parsed = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+		return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+			? { ok: true, value: parsed }
+			: { ok: false, error: '请求体必须是 JSON 对象' };
+	} catch {
+		return { ok: false, error: '请求体不是合法 JSON' };
+	}
+}
+
+/** 归一化一份「当前生效的工具列表」，面板与状态响应共用。 */
+function toolNames(settings) {
+	if (settings.enabled !== true) return [];
+	const names = [];
+	if (settings.allowCapture) names.push('window_list', 'screenshot');
+	if (settings.allowInput) names.push('window_activate', 'mouse_click', 'type_text', 'key', 'scroll');
+	return names;
+}
+
+/** 组装只读状态快照。面板与工具读同一份口径。 */
+function buildState(wiring) {
+	return {
+		ok: true,
+		now: Date.now(),
+		plugin: { name: pkg, entry: name },
+		effective: { ...wiring.settings },
+		defaults: { ...DEFAULTS },
+		configError: wiring.configError,
+		tools: toolNames(wiring.settings),
+		registeredTools: wiring.registeredTools.slice(),
+		imageCacheSize: imageCache.size,
+		platform: process.platform,
+	};
+}
+
+/**
+ * 挂两条路由：读状态、改设置。每条都以 isAdmitted 开头。
+ * @returns {Function|null} 反注册回调；宿主没有 webServer 时返回 null。
+ */
+function registerRoutes(ctx, wiring) {
+	let webServer = null;
+	try {
+		webServer = ctx.webServer ?? ctx.get?.('webServer') ?? null;
+	} catch {
+		webServer = null;
+	}
+	if (webServer === null || typeof webServer.register !== 'function') return null;
+
+	const register = (path, handler) => {
+		try {
+			return webServer.register({ kind: 'exact', path, handler });
+		} catch (error) {
+			wiring.logger?.warn?.(`${pkg}: 路由注册失败 ${path}: ${error?.message ?? error}`);
+			return null;
+		}
+	};
+
+	const onState = register(STATE_PATH, (request, response) => {
+		if (!isAdmitted(request)) return writeJson(response, 403, { ok: false, error: '禁止：来源不匹配' });
+		const method = request.method === undefined ? 'GET' : request.method;
+		if (method !== 'GET' && method !== 'HEAD') return writeJson(response, 405, { ok: false, error: '方法不允许' });
+		try {
+			writeJson(response, 200, buildState(wiring));
+		} catch (error) {
+			writeJson(response, 200, { ok: false, error: error?.message ?? String(error) });
+		}
+	});
+
+	const onSettings = register(SETTINGS_PATH, async (request, response) => {
+		if (!isAdmitted(request)) return writeJson(response, 403, { ok: false, error: '禁止：来源不匹配' });
+		if (request.method !== undefined && request.method !== 'POST') {
+			return writeJson(response, 405, { ok: false, error: '方法不允许' });
+		}
+		const body = await readJsonBody(request);
+		if (!body.ok) return writeJson(response, 400, { ok: false, error: body.error });
+		const { field, value } = body.value;
+		if (typeof field !== 'string' || field === '') {
+			return writeJson(response, 400, { ok: false, error: '缺少 field' });
+		}
+		if (!(field in DEFAULTS)) {
+			return writeJson(response, 400, { ok: false, error: `未知字段 '${field}'` });
+		}
+		try {
+			const next = await wiring.store.mutate((current) => {
+				const copy = { ...current };
+				if (value === null) delete copy[field];
+				else copy[field] = value;
+				return copy;
+			});
+			const { settings, configError } = resolveSettings({ ...wiring.patchConfig, ...next });
+			wiring.settings = settings;
+			wiring.configError = configError;
+			// 安全闸门改动后立刻重挂工具，不需要重启
+			syncTools(wiring);
+			writeJson(response, 200, {
+				ok: true,
+				effective: { ...settings },
+				defaults: { ...DEFAULTS },
+				configError,
+				tools: toolNames(settings),
+				registeredTools: wiring.registeredTools.slice(),
+			});
+		} catch (error) {
+			writeJson(response, 500, { ok: false, error: error?.message ?? String(error) });
+		}
+	});
+
+	return () => {
+		for (const off of [onState, onSettings]) {
+			if (typeof off === 'function') {
+				try {
+					off();
+				} catch {
+					/* 宿主可能已拆除 */
+				}
+			}
+		}
+	};
+}
+
+/** 按当前设置重挂工具；先全部卸掉再按需注册，避免重复注册。 */
+function syncTools(wiring) {
+	if (wiring.disposed) return;
+	if (typeof wiring.offTools === 'function') {
+		try {
+			wiring.offTools();
+		} catch {
+			/* ignore */
+		}
+		wiring.offTools = null;
+	}
+	wiring.registeredTools = [];
+	if (wiring.settings.enabled !== true) return;
+	if (typeof wiring.ctx.tools?.register !== 'function') return;
+	try {
+		wiring.offTools = registerTools(wiring.ctx, wiring);
+		wiring.registeredTools = toolNames(wiring.settings);
+	} catch (error) {
+		wiring.logger?.warn?.(`${pkg}: 工具注册失败：${error?.message ?? error}`);
+	}
+}
+
+/** 读状态文件并重算生效配置；被面板写入后调用。 */
+async function refreshFromSettings(wiring) {
+	if (wiring.disposed === true) return null;
+	if (wiring.refreshing === true) return null;
+	wiring.refreshing = true;
+	try {
+		const layer = await wiring.store.read();
+		const { settings, configError } = resolveSettings({ ...wiring.patchConfig, ...layer });
+		wiring.settings = settings;
+		wiring.configError = configError;
+		syncTools(wiring);
+		return settings;
+	} catch (error) {
+		wiring.logger?.warn?.(`${pkg}: 读取设置失败：${error?.message ?? error}`);
+		return null;
+	} finally {
+		wiring.refreshing = false;
+	}
+}
+
+/* ------------------------------------------------------------------ */
+/* 挂载                                                               */
+/* ------------------------------------------------------------------ */
+
+/**
+ * 挂载：装配设置、按设置注册工具、挂面板路由，并在设置变化时重挂工具。
+ * 任何一处拿不到服务都静默降级，绝不在挂载时抛错。
+ * @param ctx - Host root context.
+ * @param config - this entry's patch config (the deploy defaults).
+ */
+function apply(ctx, config = {}) {
+	const logger = ctx.logger ?? null;
+	const patchConfig = { ...DEFAULTS, ...(config && typeof config === 'object' ? config : {}) };
+	const initial = resolveSettings(patchConfig);
+	const wiring = {
+		ctx,
+		logger,
+		store: new FileStore({ dir: stateDirectory(), file: 'settings.json' }),
+		patchConfig,
+		settings: initial.settings,
+		configError: initial.configError,
+		disposed: false,
+		refreshing: false,
+		offTools: null,
+		registeredTools: [],
+	};
+
+	const offRoutes = registerRoutes(ctx, wiring);
+	syncTools(wiring);
+	// 状态覆盖层可能在上一次会话里写过，异步读一次覆盖它
+	void refreshFromSettings(wiring);
+
+	const stop = () => {
+		wiring.disposed = true;
+		if (typeof wiring.offTools === 'function') {
+			try {
+				wiring.offTools();
+			} catch {
+				/* ignore */
+			}
+			wiring.offTools = null;
+		}
+		if (typeof offRoutes === 'function') {
+			try {
+				offRoutes();
+			} catch {
+				/* ignore */
+			}
+		}
+		imageCache.clear();
+	};
+	if (typeof ctx.effect === 'function') {
+		ctx.effect(() => () => stop(), `${pkg}: mount`);
+	} else {
+		ctx.once?.('disposed', stop);
+	}
+}
+
+export { DEFAULTS as CONFIG_DEFAULTS, DEFAULTS, FileStore, apply, buildState, inject, isAdmitted, isExcludedTitle, name, pkg, registerRoutes, registerTools, resolveSettings, stateDirectory, toolNames };
+

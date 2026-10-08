@@ -1,6 +1,6 @@
 {
   "meta": {
-    "title": "Screen View",
-    "description": "Capture screenshots of the desktop or a single window, list the open windows on the local machine, and drive the real mouse and keyboard."
+    "title": "Desktop Control",
+    "description": "Let the agent see and operate your real desktop: capture the screen or a single window, list windows, and drive the mouse and keyboard. Turn input control off or exclude sensitive windows in settings."
   }
 }

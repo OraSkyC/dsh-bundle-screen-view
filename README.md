@@ -1,9 +1,12 @@
-# 屏幕视野 · dsh-bundle-screen-view
+# 桌面操控 · dsh-bundle-screen-view
 
 一个 [DeepSeek Harness](https://github.com/OraSkyC/dsh-bundle-screen-view)（DSH）插件：
-给智能体装上**眼睛和手** —— 截取本地桌面、列出窗口，并驱动真实的鼠标与键盘。
+让智能体**看见并操作你的真实桌面** —— 截取屏幕、列出窗口，并驱动鼠标与键盘。
 
 > [English](README.en.md) · 简体中文
+
+> **名字说明**：这个插件以前叫「屏幕视野」，但那个名字只描述了「看」。
+> 它实际上有 5 个工具在「动手」，所以改名为**桌面操控**。
 
 ---
 
@@ -24,6 +27,10 @@
 - 你清楚这个插件的能力范围，并且**只在你自己控制的机器上使用**；
 - 你接受智能体在会话里可能调用它们（这取决于你的权限预设，见下面「怎么降低风险」）；
 - 不要把一个带这些工具的会话，交给一个你不信任的提示词或不可信的网页内容去驱动。
+
+**插件本身没有「确认后执行」机制** —— 权限允许时不会弹窗征求同意。但它提供三道
+**可即时生效的安全闸门**（见下面「设置」），其中最重要的一条是
+**只保留「看」、关掉「动手」**。
 
 ## 它能做什么
 
@@ -67,6 +74,40 @@ dsh plugin --profile desktop add https://github.com/OraSkyC/dsh-bundle-screen-vi
 
 装完**重启 DSH**。
 
+## 设置
+
+**设置 → 插件 → 桌面操控**。改动**立即生效，不用重启** —— 关掉输入组后，那 5 个工具
+会当场从会话里消失。
+
+配置分两层，优先级从低到高：
+
+| 层 | 位置 | 生效时机 |
+| --- | --- | --- |
+| 部署默认值 | 本包的 [`cordis.patch.yml`](./cordis.patch.yml) | 改完需**重启 DSH** |
+| 用户覆盖 | `%USERPROFILE%\.dsh\state\dsh-bundle-screen-view\settings.json` | **立即生效** |
+
+用户覆盖层是**稀疏**的：只存你在面板里真正改过的字段。点「恢复默认」是把那个键**删掉**，
+于是自动回落到部署配置。
+
+### 安全闸门
+
+| 键 | 默认 | 说明 |
+| --- | --- | --- |
+| `enabled` | `true` | 总开关。关闭后**一个工具都不注册**，面板仍可打开。 |
+| `allowCapture` | `true` | 注册 `window_list` + `screenshot`。它们不会动你的鼠标，但会把屏幕内容交给模型 —— 涉密屏幕上建议关掉。 |
+| `allowInput` | `true` | 注册 `window_activate` / `mouse_click` / `type_text` / `key` / `scroll`。**只想让智能体「看」就把它关掉。** |
+
+### 行为
+
+| 键 | 默认 | 范围 | 说明 |
+| --- | --- | --- | --- |
+| `captureMaxWidth` | `2560` | 320–8192 | 截图默认最大宽度，超出等比缩小。模型仍可在单次调用里用 `maxWidth` 覆盖。 |
+| `imageCacheSize` | `64` | 4–512 | 截图引用保留多少张。太小会导致较早的截图无法回传给模型。 |
+| `excludeWindowTitles` | `[]` | — | 逗号分隔，大小写不敏感。命中的窗口**不会出现在 `window_list` 里，也不能被截图或操作** —— 用来挡住密码管理器、网银这类窗口。 |
+
+`excludeWindowTitles` 是唯一一个「隐私」性质的设置，它在**两条路径上都生效**
+（列出与操作），所以被排除的窗口不会从别的入口泄露出去。
+
 ## 要求
 
 | 项目 | 要求 |
@@ -77,21 +118,25 @@ dsh plugin --profile desktop add https://github.com/OraSkyC/dsh-bundle-screen-vi
 | npm 依赖 | **无** —— 见下面「koffi 是怎么来的」 |
 | 构建步骤 | **无** |
 
-插件只依赖 Host 提供的 `tools` 和 `attachments` 两个服务（`inject = ['tools', 'attachments']`），
-没有浏览器半侧，因此**插件页里不会出现配置卡** —— 它是纯 Host 能力，装上就有工具。
+插件依赖 Host 提供的 `tools`、`attachments` 和 `webServer` 三个服务
+（`inject = ['tools', 'attachments', 'webServer']`）。`webServer` 是**硬依赖**：
+Cordis 的 `ctx` 是受限代理，读一个没声明在 `inject` 里的属性会**抛错**而不是返回
+`undefined`，漏声明会让整个 `apply()` 失败、插件在插件页显示「异常」。
 
 ## 怎么降低风险
 
-插件本身不提供开关，但有三层现成的控制手段：
+现在有四层控制手段：
 
-1. **权限预设**：DSH 的权限预设（`read-only` / `workspace-write` / `danger-full-access`）
-   决定会话能做什么，是主要闸门。
-2. **不装即无**：这些工具只有在插件被加载时才存在。做完自动化的事之后卸载或停用它即可。
-3. **提示词层面**：工具说明里已经写明「只应在用户要求操作 UI 时使用，并优先针对单个窗口」，
+1. **插件自带的安全闸门**（推荐）：在插件页把 `allowInput` 关掉，智能体就只剩「看」的能力。
+   这是最直接、也最不需要重启的一层。
+2. **权限预设**：DSH 的权限预设（`read-only` / `workspace-write` / `danger-full-access`）
+   决定会话能做什么。
+3. **不装即无**：这些工具只有在插件被加载时才存在。做完自动化的事之后卸载或停用它即可。
+4. **提示词层面**：工具说明里已经写明「只应在用户要求操作 UI 时使用，并优先针对单个窗口」，
    这是给模型的约束，不是技术强制。
 
-**请注意：这个插件没有实现「确认后才执行」的机制。** 一旦工具可用且权限允许，
-智能体调用 `mouse_click` 不会弹窗征求你同意。
+**请记住插件本身没有「确认后执行」机制。** 一旦工具可用且权限允许，
+智能体调用 `mouse_click` 不会弹窗征求你的同意。
 
 ## 实现要点
 
@@ -137,9 +182,10 @@ GDI 给出的 BGRA 缓冲直接编码成 PNG 交给 Host 的 attachments 服务�
 
 ```
 dsh-bundle-screen-view/
-├── package.json         # 清单：dsh.bundle.patch / files / os: win32
-├── cordis.patch.yml     # 注册 entry（id: screen-view）
-├── index.js             # 7 个工具的注册、参数校验、结果渲染
+├── package.json         # 清单：dsh.bundle.patch / dsh.client / files / os: win32
+├── cordis.patch.yml     # 注册 entry（id: screen-view）+ 部署默认配置
+├── index.js             # 配置契约、7 个工具的注册与闸门、面板路由
+├── client.js            # 浏览器半侧：插件页里的设置卡（React 由 loader 注入）
 ├── lib/
 │   ├── capture.js       # GDI 截图（BitBlt 主路径 + PrintWindow 兜底）、窗口枚举、koffi 解析
 │   ├── input.js         # SendInput 输入合成（鼠标 / 键盘 / 滚轮 / 激活窗口）
@@ -150,16 +196,23 @@ dsh-bundle-screen-view/
 ├── README.md            # 本文件
 ├── README.en.md         # 英文版
 ├── CHANGELOG.md
-└── LICENSE
+├── LICENSE
+├── test-host.mjs        # 宿主侧：配置、闸门、路由、工具注册
+└── test-client.mjs      # 浏览器侧：注册路径、组件渲染、CSS 变量有效性
 ```
 
 ## 开发
 
 ```bash
-npm run check     # 四个文件的语法检查
+npm run check     # 五个文件的语法检查
+npm test          # 宿主 27 项断言组 + 客户端 20 项断言组
 ```
 
-没有测试套件 —— 这些工具的效果只能在真实桌面上验证。
+测试覆盖了配置归一化、三道安全闸门、窗口排除、状态覆盖层、面板路由，
+以及面板组件的渲染（含**标签是否可见**和**用到的 CSS 变量是否真实存在**这两类回归 ——
+它们出问题时界面不会报错，只能靠断言拦住）。
+
+工具在**真实桌面**上的效果（截图是否正确、点击是否落在对的坐标）仍然只能手工验证。
 
 ## 许可证
 

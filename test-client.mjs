@@ -1,0 +1,396 @@
+// 客户端半侧验证：走真实的 window.__ModuleLoader__ 注册路径，
+// 再驱动 factory / apply / 组件渲染。跑完可删。
+import assert from "node:assert/strict";
+
+// ---- 浏览器桩 ---------------------------------------------------------
+const registrations = [];
+globalThis.window = { __ModuleLoader__: { load: (r) => registrations.push(r) } };
+globalThis.document = { addEventListener() {}, removeEventListener() {}, visibilityState: "visible" };
+globalThis.AbortController = class { constructor() { this.signal = { aborted: false }; } abort() {} };
+globalThis.fetch = async () => { throw new Error("no network in test"); };
+
+await import("./client.js");
+
+let passed = 0;
+const ok = (label) => { passed += 1; console.log(`  ✓ ${label}`); };
+
+// ---- 可多次渲染的迷你 React ------------------------------------------
+// 必须真的按 hook 序号保存状态、真的跑 effect，否则 PanelPage 永远停在
+// loading 分支，折叠/标签这类回归根本测不到。
+function makeReact() {
+	let slots = [];
+	let marks = [];
+	let pending = [];
+	let cleanups = [];
+	let cursor = 0;
+	const changed = (i, watch) => {
+		const prev = marks[i];
+		if (watch === undefined || prev === undefined) return true;
+		if (watch.length !== prev.length) return true;
+		return watch.some((value, k) => value !== prev[k]);
+	};
+	return {
+		createElement(type, props, ...children) {
+			const flat = [];
+			for (const child of children) Array.isArray(child) ? flat.push(...child) : flat.push(child);
+			if (typeof type === "function") {
+				const merged = { ...(props ?? {}) };
+				// 只在真的有位置子节点时才覆盖 children —— 否则会把通过 props
+				// 传进来的 children 抹成 undefined（真实 React 也是这个行为）。
+				if (flat.length > 0) merged.children = flat.length === 1 ? flat[0] : flat;
+				return type(merged);
+			}
+			return { type, props: props ?? null, children: flat };
+		},
+		useState(initial) {
+			const i = cursor++;
+			if (!(i in slots)) slots[i] = typeof initial === "function" ? initial() : initial;
+			return [slots[i], (next) => { slots[i] = typeof next === "function" ? next(slots[i]) : next; }];
+		},
+		useEffect(fn, watch) { const i = cursor++; if (changed(i, watch)) { marks[i] = watch; pending.push(fn); } },
+		useCallback(fn, watch) { const i = cursor++; if (changed(i, watch)) { marks[i] = watch; slots[i] = fn; } return slots[i]; },
+		useRef(initial) { const i = cursor++; if (!(i in slots)) slots[i] = { current: initial }; return slots[i]; },
+		begin() { cursor = 0; pending = []; },
+		flush() { for (const fn of pending.splice(0)) { const off = fn(); if (typeof off === "function") cleanups.push(off); } },
+		teardown() { for (const off of cleanups.splice(0)) { try { off(); } catch { /* ignore */ } } }
+	};
+}
+function renderPanel(reactApi, PanelPage, tt) {
+	reactApi.begin();
+	const tree = PanelPage({ tt, localeSubscribe: () => () => {} });
+	reactApi.flush();
+	return tree;
+}
+function findButtons(node, found = []) {
+	if (node === null || typeof node !== "object") return found;
+	if (node.type === "button") found.push(node);
+	for (const child of node.children ?? []) findButtons(child, found);
+	return found;
+}
+let REGISTRATION = null;
+function freshReact() {
+	const instance = makeReact();
+	REGISTRATION.factory(() => instance);
+	return instance;
+}
+
+console.log("\n[A] 浏览器注册路径");
+{
+	assert.equal(registrations.length, 1);
+	REGISTRATION = registrations[0];
+	assert.equal(REGISTRATION.id, "dsh-bundle-screen-view");
+	assert.equal(typeof REGISTRATION.factory, "function");
+	ok(`window.__ModuleLoader__ 收到 id=${REGISTRATION.id}`);
+}
+
+console.log("\n[B] clientFactory 与 apply()");
+const react = makeReact();
+const out = REGISTRATION.factory(() => react);
+assert.deepEqual(out.inject, ["slots", "locale"]);
+assert.equal(typeof out.apply, "function");
+assert.ok(out.panel);
+ok(`inject=${JSON.stringify(out.inject)}`);
+
+const events = [];
+const disposers = [];
+out.apply({
+	logger: { warn() {}, info() {} },
+	locale: {
+		register(ns, dicts) { events.push(["register", ns, Object.keys(dicts).join("|")]); return () => {}; },
+		bind() { return (key) => key; },
+		subscribe() { return () => {}; }
+	},
+	slots: {
+		inject(_slot, fn) { const r = fn(); disposers.push(r); return () => {}; },
+		register(meta, component) { events.push(["slot", meta.name, meta.key, meta.locale, typeof component]); return () => {}; }
+	},
+	effect(fn) { disposers.push(fn()); return () => {}; }
+});
+{
+	const reg = events[0];
+	assert.equal(reg[0], "register");
+	assert.equal(reg[1], "dsh-bundle-screen-view");
+	assert.deepEqual(reg[2].split("|").sort(), ["en", "zh"]);
+	const slot = events[1];
+	assert.equal(slot[1], "plugins.bundle.config");
+	assert.equal(slot[2], "dsh-bundle-screen-view");
+	assert.equal(slot[4], "function");
+	ok(`字典注册 → ${reg[1]}；slot 注册 → ${slot[1]} / key=${slot[2]}`);
+}
+{
+	// locale 缺失
+	out.apply({ effect: () => {}, slots: { inject() { return () => {}; } } });
+	ok("locale 缺失 → 不抛错");
+	// slots 抛错
+	const realWarn = console.warn;
+	console.warn = () => {};
+	try {
+		out.apply({
+			locale: { register() { return () => {}; }, bind() { return (k) => k; }, subscribe() { return () => {}; } },
+			slots: { inject(_s, fn) { const r = fn(); if (r) r(); throw new Error("boom"); } },
+			effect() {}
+		});
+	} finally { console.warn = realWarn; }
+	ok("slots 注册抛错 → 不向外抛");
+}
+
+console.log("\n[C] 组件渲染");
+{
+	const { PanelPage, SectionCard, StatusRow, Field, BoolField, Button } = out.panel.components;
+	for (const [label, c] of [["PanelPage", PanelPage], ["SectionCard", SectionCard], ["StatusRow", StatusRow],
+		["Field", Field], ["BoolField", BoolField], ["Button", Button]]) {
+		assert.equal(typeof c, "function", `${label} 应为函数`);
+	}
+	ok("组件均为函数");
+
+	const loadingTree = renderPanel(freshReact(), PanelPage, (k) => k);
+	assert.match(JSON.stringify(loadingTree), /panel\.loading/);
+	ok("未加载 → loading 分支");
+
+	// Field：左列标签 + 右列控件。标签曾经整个漏渲染过，必须显式断言。
+	const fReact = freshReact();
+	fReact.begin();
+	const field = Field({
+		name: "captureMaxWidth", label: "截图最大宽度", hint: "取值范围 320–8192",
+		value: 2560, kind: "number", tt: (k) => k
+	});
+	const labelCol = field.children[0];
+	assert.match(JSON.stringify(labelCol), /截图最大宽度/, "Field 必须渲染可见标签");
+	assert.match(JSON.stringify(labelCol), /取值范围/, "hint 应在标签列");
+	assert.ok(!JSON.stringify(labelCol).includes("aria-label"), "标签必须是可见文本");
+	assert.equal(field.children[1].children[0].type, "input");
+	assert.equal(field.children[1].children[0].props.value, "2560");
+	fReact.teardown();
+	ok("Field 渲染可见标签 + 说明 + 值");
+
+	// BoolField：标签可见 + 开关几何与配色对齐 DSH 原生组件
+	for (const on of [true, false]) {
+		const bReact = freshReact();
+		bReact.begin();
+		const node = BoolField({ name: "allowInput", label: "允许操作鼠标与键盘", hint: "会真的移动光标", value: on, tt: (k) => k });
+		assert.match(JSON.stringify(node.children[0]), /允许操作鼠标与键盘/, `value=${on} 必须渲染标签`);
+		const track = findButtons(node).find((b) => b.props?.role === "switch");
+		assert.ok(track !== undefined, "应渲染 role=switch");
+		assert.equal(track.props["aria-checked"], on);
+		assert.equal(track.props.style.width, 36);
+		assert.equal(track.props.style.height, 20);
+		assert.equal(track.props.style.padding, 2);
+		const bg = track.props.style.background;
+		assert.ok(typeof bg === "string" && bg.trim() !== "" && bg !== "none", `${on} 态轨道必须有背景色`);
+		const thumb = track.children.find((c) => c?.type === "span");
+		if (on) {
+			assert.equal(thumb.props.style.transform, "translateX(16px)");
+			assert.match(JSON.stringify(thumb.props.style), /label-primary-foreground/);
+		} else {
+			assert.equal(thumb.props.style.transform, undefined);
+			assert.match(JSON.stringify(thumb.props.style), /switch-thumb/);
+		}
+		bReact.teardown();
+	}
+	ok("BoolField 可见标签 + 开关几何/配色对齐 DSH 原生组件（开关两态）");
+
+	// 开关与关闭态的背景色必须不同，否则用户分不出开关
+	{
+		const bReact = freshReact();
+		bReact.begin();
+		const onNode = BoolField({ name: "n", label: "L", value: true, tt: (k) => k });
+		const offNode = BoolField({ name: "n", label: "L", value: false, tt: (k) => k });
+		const bgOf = (n) => findButtons(n).find((b) => b.props?.role === "switch").props.style.background;
+		assert.notEqual(bgOf(onNode), bgOf(offNode), "开/关态轨道背景色必须不同");
+		bReact.teardown();
+	}
+	ok("开关开/关两态视觉可区分");
+}
+
+console.log("\n[D] 文案键对齐");
+{
+	const { zh, en } = out.panel.dictionaries;
+	assert.deepEqual(Object.keys(zh).sort(), Object.keys(en).sort());
+	assert.ok(Object.keys(zh).length >= 40);
+	ok(`中英各 ${Object.keys(zh).length} 个键，键集一致`);
+
+	const KEY_RE = /^[a-z][a-z0-9]*([.][a-z][a-z0-9]*)+$/i;
+	const used = new Set();
+	const walk = (node) => {
+		if (node === null || typeof node !== "object") return;
+		for (const value of Object.values(node)) {
+			if (typeof value === "string" && KEY_RE.test(value)) used.add(value);
+			else walk(value);
+		}
+	};
+	const { PanelPage, SectionCard, Field, BoolField, StatusRow } = out.panel.components;
+	for (const node of [
+		PanelPage({ tt: (k) => k, localeSubscribe: () => () => {} }),
+		SectionCard({ title: "S", open: true, onToggle: () => {}, tt: (k) => k }),
+		StatusRow({ label: "L", value: "V" }),
+		Field({ name: "n", label: "L", value: "v", kind: "text", tt: (k) => k }),
+		BoolField({ name: "n", label: "L", value: true, tt: (k) => k })
+	]) walk(node);
+	const missing = [...used].filter((key) => !(key in zh));
+	assert.deepEqual(missing, [], "缺字典键: " + missing.join(", "));
+	ok(`渲染树引用 ${used.size} 个键，全部在字典中`);
+}
+
+console.log("\n[E] 端点路径");
+{
+	const { NS, STATE_PATH, SETTINGS_PATH } = out.panel.paths;
+	assert.equal(NS, "dsh-bundle-screen-view");
+	assert.equal(STATE_PATH, "/api/dsh-bundle-screen-view/state");
+	assert.equal(SETTINGS_PATH, "/api/dsh-bundle-screen-view/settings");
+	ok(`面板端点: ${STATE_PATH} / ${SETTINGS_PATH}`);
+}
+
+console.log("\n[F] 面板：安全闸门与状态（端到端）");
+{
+	const { PanelPage } = out.panel.components;
+	const zh = out.panel.dictionaries.zh;
+	const tt = (k) => zh[k] ?? k;
+
+	/** 用给定 state 全新挂载一次面板，返回渲染树。 */
+	async function mountWith(state) {
+		globalThis.fetch = async () => ({ ok: true, status: 200, json: async () => state });
+		const reactApi = freshReact();
+		renderPanel(reactApi, PanelPage, tt);            // 首渲染 → loading，effect 里发 fetch
+		await new Promise((r) => setTimeout(r, 20));
+		const tree = renderPanel(reactApi, PanelPage, tt); // 数据已就位
+		return { reactApi, tree };
+	}
+
+	const base = {
+		ok: true,
+		plugin: { name: "dsh-bundle-screen-view", entry: "screen-view" },
+		effective: { enabled: true, allowCapture: true, allowInput: true, captureMaxWidth: 2560, imageCacheSize: 64, excludeWindowTitles: [] },
+		defaults: { enabled: true, allowCapture: true, allowInput: true, captureMaxWidth: 2560, imageCacheSize: 64, excludeWindowTitles: [] },
+		configError: null,
+		tools: ["window_list", "screenshot", "window_activate", "mouse_click", "type_text", "key", "scroll"],
+		registeredTools: ["window_list", "screenshot", "window_activate", "mouse_click", "type_text", "key", "scroll"],
+		imageCacheSize: 3,
+		platform: "win32"
+	};
+
+	{
+		const { reactApi, tree } = await mountWith(base);
+		const json = JSON.stringify(tree);
+		assert.ok(!json.includes("panel.loading"), "应进入数据分支");
+		assert.match(json, /桌面操控/, "应渲染面板标题");
+		assert.match(json, /安全闸门/, "应有安全闸门区块");
+		assert.match(json, /行为/, "应有行为区块");
+		for (const label of ["截图最大宽度（像素）", "图片缓存条数", "排除的窗口标题"]) {
+			assert.ok(json.includes(label), `缺少字段标签: ${label}`);
+		}
+		// 已注册工具必须以 <code> chip 形式列在状态区。
+		// 注意：不能只判断 json 里有没有工具名 —— 字段说明文字里也提到了
+		// window_list / mouse_click 这些名字，那样断言会被蒙混过去。
+		const collectCode = (n, found = []) => {
+			if (n === null || typeof n !== "object") return found;
+			if (n.type === "code") found.push((n.children ?? []).join(""));
+			for (const c of n.children ?? []) collectCode(c, found);
+			return found;
+		};
+		const chips = collectCode(tree).sort();
+		assert.deepEqual(
+			chips,
+			["key", "mouse_click", "screenshot", "scroll", "type_text", "window_activate", "window_list"].sort(),
+			"状态区应以 code chip 列出全部 7 个已注册工具"
+		);
+		ok(`状态区以 chip 列出全部 ${chips.length} 个已注册工具`);
+		assert.match(json, /输入控制已开启/, "allowInput=true 时应显示风险警告");
+		assert.match(json, /没有.*确认后执行|没有\*\*「确认后执行」\*\*机制/, "警告里必须写明没有确认机制");
+		ok("真实数据下面板渲染出标题、三个区块、字段标签、工具列表与风险警告");
+		reactApi.teardown();
+	}
+
+	{
+		const offState = { ...base, effective: { ...base.effective, allowInput: false }, registeredTools: ["window_list", "screenshot"] };
+		const { reactApi, tree } = await mountWith(offState);
+		const json = JSON.stringify(tree);
+		assert.match(json, /输入控制已关闭/, "allowInput=false 应显示「只能看不能动」");
+		assert.ok(!json.includes("输入控制已开启"), "不应再显示开启警告");
+		ok("allowInput=false → 切换为「只能看不能动」提示");
+		reactApi.teardown();
+	}
+
+	{
+		const { reactApi, tree } = await mountWith({ ...base, platform: "darwin" });
+		assert.match(JSON.stringify(tree), /user32/, "非 win32 应提示平台不支持");
+		ok("非 Windows 平台 → 显示不支持提示");
+		reactApi.teardown();
+	}
+
+	{
+		const offState = {
+			...base,
+			effective: { ...base.effective, enabled: false },
+			registeredTools: [],
+			tools: []
+		};
+		const { reactApi, tree } = await mountWith(offState);
+		const json = JSON.stringify(tree);
+		assert.match(json, /插件已停用/, "enabled=false 应显示停用提示");
+		assert.ok(!json.includes("输入控制已开启"), "停用时不应再显示输入警告");
+		// 停用后另外两个闸门应被禁用
+		const switches = findButtons(tree).filter((b) => b.props?.role === "switch");
+		assert.equal(switches.length, 3, `应有 3 个开关，实际 ${switches.length}`);
+		assert.equal(switches.find((b) => b.props["aria-label"] === "启用插件").props.disabled, false);
+		assert.equal(switches.find((b) => b.props["aria-label"] === "允许截屏与列窗口").props.disabled, true);
+		assert.equal(switches.find((b) => b.props["aria-label"] === "允许操作鼠标与键盘").props.disabled, true);
+		ok("enabled=false → 显示停用提示，其余闸门被禁用");
+		reactApi.teardown();
+	}
+
+	{
+		// 排除名单从数组渲染成逗号串
+		const exState = { ...base, effective: { ...base.effective, excludeWindowTitles: ["1Password", "银行"] } };
+		const { reactApi, tree } = await mountWith(exState);
+		assert.match(JSON.stringify(tree), /1Password, 银行/, "排除名单应渲染为逗号串");
+		ok("排除名单回显为逗号串");
+		reactApi.teardown();
+	}
+}
+
+console.log("\n[G] CSS 变量必须真实存在（回归）");
+{
+	// 写一个不存在的 CSS 变量会让整条声明被判非法、静默失效，界面无任何报错。
+	// 清单来自 DSH 的 @deepseek-ai/dsh-client-ui-theme 实际定义。
+	const DSH_TOKENS = new Set([
+		"--dsw-alias-bg-base", "--dsw-alias-bg-layer-1", "--dsw-alias-bg-layer-2",
+		"--dsw-alias-bg-layer-3", "--dsw-alias-bg-layer-4", "--dsw-alias-bg-mask-1",
+		"--dsw-alias-bg-module-platform", "--dsw-alias-border-l1", "--dsw-alias-border-l2",
+		"--dsw-alias-border-l3", "--dsw-alias-border-l4", "--dsw-alias-brand-primary",
+		"--dsw-alias-button-primary-fill", "--dsw-alias-button-primary-hover",
+		"--dsw-alias-button-ghost-active-border", "--dsw-alias-button-ghost-active-fill",
+		"--dsw-alias-interactive-bg-active", "--dsw-alias-interactive-bg-hover",
+		"--dsw-alias-interactive-bg-hover-danger", "--dsw-alias-label-caption",
+		"--dsw-alias-label-dimmed", "--dsw-alias-label-error", "--dsw-alias-label-primary",
+		"--dsw-alias-label-primary-foreground", "--dsw-alias-label-secondary",
+		"--dsw-alias-label-shimmer", "--dsw-alias-label-tertiary", "--dsw-alias-link",
+		"--dsw-alias-markdown-code-block", "--dsw-alias-markdown-inline-code",
+		"--dsw-alias-markdown-tag", "--dsw-alias-state-business-primary",
+		"--dsw-alias-state-error-primary", "--dsw-alias-state-idle-primary",
+		"--dsw-alias-state-success-primary", "--dsw-alias-state-success-tertiary",
+		"--dsw-alias-state-warn-label", "--dsw-alias-state-warn-primary",
+		"--dsw-alias-state-warn-tertiary", "--dsw-alias-switch-thumb",
+		"--dsw-alias-toast-bg", "--dsw-alias-toast-label", "--dsw-alias-tooltip-bg",
+		"--dsw-alias-tooltip-key-bg", "--dsw-alias-scrollbar-bg-l2",
+		"--dsw-alias-menu-group-header-fill", "--dsw-alias-menu-icon",
+		"--dsw-elevation-panel", "--dsw-elevation-prominent", "--dsw-elevation-soft",
+		"--dsw-elevation-stroke-color", "--dsw-focus-ring-color", "--dsw-focus-ring-width",
+		"--dsw-font-family", "--dsw-font-markdown-code-font-family",
+		"--dsw-font-markdown-base", "--dsw-font-markdown-base-strong",
+		"--dsw-font-markdown-code", "--dsw-font-markdown-code-block",
+		"--dsw-radius-xs", "--dsw-radius-sm", "--dsw-radius-md", "--dsw-radius-lg",
+		"--dsw-radius-panel", "--dsw-shadow-lv3", "--dsw-static-neutral-bluish-00"
+	]);
+	const { readFile } = await import("node:fs/promises");
+	const source = await readFile(new URL("./client.js", import.meta.url), "utf8");
+	const used = new Set();
+	for (const m of source.matchAll(/var\((--dsw-[a-z0-9-]+)/g)) used.add(m[1]);
+	assert.ok(used.size >= 15, `应提取到足够多 token，实际 ${used.size}`);
+	const unknown = [...used].filter((t) => !DSH_TOKENS.has(t)).sort();
+	assert.deepEqual(unknown, [], "以下变量在 DSH 主题里不存在，会让整条样式静默失效:\n    " + unknown.join("\n    "));
+	ok(`用到的 ${used.size} 个 --dsw-* 变量都真实存在`);
+}
+
+for (const d of disposers) if (typeof d === "function") d();
+console.log(`\n客户端全部通过（${passed} 项断言组）`);
+process.exit(0);   // 面板的轮询 setInterval 还挂着，直接退出

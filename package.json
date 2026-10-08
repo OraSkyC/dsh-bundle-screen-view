@@ -1,14 +1,15 @@
 {
   "name": "dsh-bundle-screen-view",
-  "displayName": "屏幕视野",
-  "description": "Optional DSH bundle that gives the Host desktop tools: window_list and screenshot (read-only), plus window_activate, mouse_click, type_text, key and scroll for driving the real mouse and keyboard.",
-  "version": "1.1.0",
+  "displayName": "桌面操控",
+  "description": "Optional DSH bundle that gives the Host desktop tools: window_list and screenshot (read-only), plus window_activate, mouse_click, type_text, key and scroll for driving the real mouse and keyboard — with safety gates and a settings card in the Plugins page.",
+  "version": "1.2.0",
   "private": true,
   "icon": "./icon.svg",
   "type": "module",
   "main": "index.js",
   "exports": {
     ".": "./index.js",
+    "./client": "./client.js",
     "./package.json": "./package.json",
     "./cordis.patch.yml": "./cordis.patch.yml",
     "./locale/*.json": "./locale/*.json"
@@ -17,6 +18,7 @@
     "icon.svg",
     "locale/*.json",
     "index.js",
+    "client.js",
     "cordis.patch.yml",
     "lib/capture.js",
     "lib/input.js",
@@ -27,7 +29,20 @@
     "LICENSE"
   ],
   "scripts": {
-    "check": "node --check index.js && node --check lib/capture.js && node --check lib/input.js && node --check lib/png.js"
+    "check": "node --check index.js && node --check client.js && node --check lib/capture.js && node --check lib/input.js && node --check lib/png.js",
+    "test": "node test-host.mjs && node test-client.mjs"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-locale"
+      ]
+    }
   },
   "keywords": [
     "dsh-plugin",
@@ -35,14 +50,9 @@
     "dsh-bundle",
     "screen-capture",
     "screenshot",
-    "automation",
+    "desktop-automation",
     "win32"
   ],
-  "dsh": {
-    "bundle": {
-      "patch": "./cordis.patch.yml"
-    }
-  },
   "engines": {
     "node": ">=22.19.0"
   },
