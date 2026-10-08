@@ -981,20 +981,13 @@ function registerRoutes(ctx, wiring) {
 			if ((settings.confirmInput === true) !== beforeConsent) sessionGrants.clear();
 			// 安全闸门改动后立刻重挂工具，不需要重启
 			syncTools(wiring);
-			writeJson(response, 200, {
-				ok: true,
-				effective: { ...settings },
-				defaults: { ...DEFAULTS },
-				configError,
-				tools: toolNames(settings),
-				registeredTools: wiring.registeredTools.slice(),
-				consent: {
-					confirmInput: settings.confirmInput === true,
-					service: resolveUserQuestions(wiring) !== null,
-					grants: grantList(),
-					timeoutMs: CONFIRM_TIMEOUT_MS,
-				},
-			});
+			// 回一份**完整状态快照**，让面板一次性替换本地状态。
+			//
+			// 以前这里只回 effective / defaults / tools / consent，客户端得逐字段合并；
+			// 漏掉任何一个字段的症状都是「显示已保存但界面不动」，只能等下一次轮询
+			// （硬编码 30 秒）。回整份快照既省掉了那份容易漏的合并逻辑，
+			// 也让派生字段（图片缓存数、授权列表）一起刷新。
+			writeJson(response, 200, buildState(wiring));
 		} catch (error) {
 			writeJson(response, 500, { ok: false, error: error?.message ?? String(error) });
 		}

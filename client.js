@@ -24,6 +24,26 @@ var dsh_bundle_screen_view_client = (function () {
 	const SETTINGS_PATH = "/api/" + NS + "/settings";
 	const CONSENT_PATH = "/api/" + NS + "/consent";
 
+	/**
+	 * 面板状态订阅：任何一次 /settings 写入成功后，把宿主的响应广播给面板。
+	 *
+	 * 为什么用订阅而不是给每个字段层层传 prop：「保存后同步界面」这件事**每个字段都必须做**，
+	 * 而漏掉一个的症状是静默的 —— 开关不动、或者「未保存」一直挂着不消失，
+	 * 只有退出重进设置页才看到新值（因为那是重新拉了一次 /state）。
+	 * 真实事故：Field / BoolField 都把响应整个丢掉了，界面只能等下一次轮询（硬编码 30 秒）。
+	 * 订阅让新增字段自动获得这个行为，想漏也漏不掉。
+	 */
+	let settingsSavedListener = null;
+	/** 广播一次保存结果。没有订阅者、响应不是对象、或订阅者自己抛错，都静默跳过。 */
+	function broadcastSettingsSaved(payload) {
+		if (typeof settingsSavedListener !== "function") return;
+		try {
+			settingsSavedListener(payload);
+		} catch {
+			/* 订阅者自己出错不该影响保存本身 */
+		}
+	}
+
 	/* ------------------------------------------------------------------ */
 	/* 文案                                                                 */
 	/* ------------------------------------------------------------------ */
@@ -562,7 +582,10 @@ var dsh_bundle_screen_view_client = (function () {
 			setError(null);
 			setNotice(null);
 			try {
-				await postJsonOrThrow(SETTINGS_PATH, { field: name, value: next });
+				const body = await postJsonOrThrow(SETTINGS_PATH, { field: name, value: next });
+				// 把宿主重算后的设置并回面板。漏掉这一步，开关就要等下一次轮询
+				// （默认 30 秒）才动 —— 用户看到的是「已保存」但开关纹丝不动。
+				broadcastSettingsSaved(body);
 				flash("ok", tt("action.saved"));
 			} catch (reason) {
 				setError(tt("action.saveError").replace("{error}", reason instanceof Error ? reason.message : String(reason)));
@@ -626,7 +649,10 @@ var dsh_bundle_screen_view_client = (function () {
 			setError(null);
 			setNotice(null);
 			try {
-				await postJsonOrThrow(SETTINGS_PATH, { field: name, value: payloadValue });
+				const body = await postJsonOrThrow(SETTINGS_PATH, { field: name, value: payloadValue });
+				// 同上：不同步回来，dirty 会一直挂在 true 上显示「未保存」，
+				// 而输入框里还是用户打的草稿 —— 看起来像没保存成功。
+				broadcastSettingsSaved(body);
 				if (payloadValue === null) setDraft("");
 				flash("ok", tt("action.saved"));
 			} catch (reason) {
@@ -804,6 +830,39 @@ var dsh_bundle_screen_view_client = (function () {
 			}
 		}, []);
 
+		/**
+		 * 把 /settings 的响应并回面板状态。
+		 *
+		 * 这是「点了开关显示已保存、但开关不动」那个 bug 的修复核心：以前这里把响应丢掉了，
+		 * 界面只能等下一次轮询才更新（硬编码 30 秒），用户合理地以为没生效、只能退出重进。
+		 *
+		 * 宿主回的是一份**完整状态快照**（不是只有 effective），所以整份覆盖就行。
+		 * 并的是宿主重算过的值，不是本地乐观值 —— 所以非法值被夹取会立刻如实显示出来。
+		 *
+		 * 同时作废在途的轮询：那个快照可能早于这次写入，如果它晚于保存返回，
+		 * 就会把刚写进去的值又盖回旧的 —— 那就变成了「有时候灵有时候不灵」。
+		 */
+		const applySaved = useCallback((payload) => {
+			generation.current += 1;
+			inFlight.current?.abort?.();
+			inFlight.current = null;
+			setData((current) => {
+				if (current === null) return current;
+				if (payload === null || typeof payload !== "object") return current;
+				return { ...current, ...payload };
+			});
+			setUpdatedAt(Date.now());
+		}, []);
+
+		// 订阅保存结果：任何字段保存成功后都会广播，这里立刻同步界面。
+		// 卸载时只在自己仍是当前订阅者的情况下清空，免得把后来者的订阅误删。
+		useEffect(() => {
+			settingsSavedListener = applySaved;
+			return () => {
+				if (settingsSavedListener === applySaved) settingsSavedListener = null;
+			};
+		}, [applySaved]);
+
 		useEffect(() => {
 			let alive = true;
 			let timer = null;
@@ -909,7 +968,7 @@ var dsh_bundle_screen_view_client = (function () {
 							label: tt("field.enabled"),
 							hint: tt("field.enabledHint"),
 							value: effective.enabled,
-							tt
+							tt,
 						}),
 						h(BoolField, {
 							name: "allowCapture",
@@ -917,7 +976,7 @@ var dsh_bundle_screen_view_client = (function () {
 							hint: tt("field.allowCaptureHint"),
 							value: effective.allowCapture,
 							disabled: disabled,
-							tt
+							tt,
 						}),
 						h(BoolField, {
 							name: "allowInput",
@@ -925,7 +984,7 @@ var dsh_bundle_screen_view_client = (function () {
 							hint: tt("field.allowInputHint"),
 							value: effective.allowInput,
 							disabled: disabled,
-							tt
+							tt,
 						}),
 						h(BoolField, {
 							name: "confirmInput",
@@ -933,7 +992,7 @@ var dsh_bundle_screen_view_client = (function () {
 							hint: tt("field.confirmInputHint"),
 							value: effective.confirmInput,
 							disabled: disabled || effective.allowInput !== true,
-							tt
+							tt,
 						}),
 						// 警告文案必须跟着闸门状态走。以前这里写死「本插件没有确认后执行机制」，
 						// 加了闸门之后那句话就成了假话 —— 面板上骗人比没有提示更糟。
@@ -960,7 +1019,7 @@ var dsh_bundle_screen_view_client = (function () {
 							value: effective.captureMaxWidth,
 							kind: "number",
 							disabled: disabled,
-							tt
+							tt,
 						}),
 						h(Field, {
 							name: "imageCacheSize",
@@ -970,7 +1029,7 @@ var dsh_bundle_screen_view_client = (function () {
 							value: effective.imageCacheSize,
 							kind: "number",
 							disabled: disabled,
-							tt
+							tt,
 						}),
 						h(Field, {
 							name: "excludeWindowTitles",
@@ -983,7 +1042,7 @@ var dsh_bundle_screen_view_client = (function () {
 							placeholder: "1Password, 银行",
 							disabled: disabled,
 							emptyMeansDefault: true,
-							tt
+							tt,
 						})
 					) : null
 				)
