@@ -10,7 +10,8 @@ const ROOT = mkdtempSync(join(tmpdir(), "dsh-sv-test-"));
 process.env.DSH_HOME = ROOT;
 
 const {
-	CONFIRM_TIMEOUT_MS,
+	CONFIRM_TIMEOUT_SLACK_MS,
+	CONFIRM_WAIT_FOREVER_MS,
 	CONSENT_ALLOW_ONCE,
 	CONSENT_ALLOW_SESSION,
 	CONSENT_DENY,
@@ -34,6 +35,7 @@ const {
 	sessionGrants,
 	stateDirectory,
 	toolNames,
+	buildState,
 	withConsent
 } = await import("./index.js");
 
@@ -116,9 +118,22 @@ console.log("\n[1] 配置归一化");
 	const d = resolveSettings({}).settings;
 	assert.deepEqual(d, {
 		enabled: true, allowCapture: true, allowInput: true, confirmInput: false,
+		confirmTimeoutSeconds: 300, confirmAllowOnTimeout: false,
 		captureMaxWidth: 2560, imageCacheSize: 64, excludeWindowTitles: []
 	});
-	ok("空配置 → 默认值（confirmInput 默认关闭 = 保持原行为）");
+	ok("空配置 → 默认值（confirmInput 默认关；超时默认拒绝）");
+
+	// 超时相关的三个字段
+	assert.equal(resolveSettings({ confirmTimeoutSeconds: 0 }).settings.confirmTimeoutSeconds, 0, "0 = 不超时，要保留");
+	assert.equal(resolveSettings({ confirmTimeoutSeconds: -5 }).settings.confirmTimeoutSeconds, 0);
+	assert.equal(resolveSettings({ confirmTimeoutSeconds: 999999 }).settings.confirmTimeoutSeconds, 86400);
+	assert.equal(resolveSettings({ confirmTimeoutSeconds: 12.6 }).settings.confirmTimeoutSeconds, 13, "取整");
+	assert.equal(resolveSettings({ confirmTimeoutSeconds: "abc" }).settings.confirmTimeoutSeconds, 300);
+	assert.equal(resolveSettings({ confirmAllowOnTimeout: true }).settings.confirmAllowOnTimeout, true);
+	// 默认是 false，所以非布尔必须回落到 false —— 这个开关绝不能被一个意外值打开
+	assert.equal(resolveSettings({ confirmAllowOnTimeout: "yes" }).settings.confirmAllowOnTimeout, false);
+	assert.equal(resolveSettings({ confirmAllowOnTimeout: 1 }).settings.confirmAllowOnTimeout, false);
+	ok("超时字段：秒数夹取到 0–86400（0=不超时），放行开关非布尔一律回落 false");
 
 	assert.equal(resolveSettings({ captureMaxWidth: 999999 }).settings.captureMaxWidth, 8192);
 	assert.equal(resolveSettings({ captureMaxWidth: 1 }).settings.captureMaxWidth, 320);
@@ -447,6 +462,113 @@ console.log("\n[10] 操作前征求同意");
 		ok("ask() 抛错（子智能体 / 无 answerer）→ 拒绝且不执行");
 	}
 
+	// ── 等待超时：默认拒绝，配成放行时才放行 ──
+	{
+		/** 一个永远不回答、但尊重 signal 的 answerer —— 模拟「人不在」。 */
+		const silentAnswerer = (onAsk) => ({
+			ask(request) {
+				if (typeof onAsk === "function") onAsk(request);
+				return new Promise((_resolve, reject) => {
+					const signal = request.signal;
+					if (signal === undefined) return;       // 没有 signal 就永远挂着
+					if (signal.aborted === true) { reject(new Error("ASK_ABORTED")); return; }
+					signal.addEventListener("abort", () => reject(new Error("ASK_ABORTED")), { once: true });
+				});
+			}
+		});
+
+		// ① 超时 + 默认（拒绝）→ 不执行
+		{
+			sessionGrants.clear();
+			let ran = 0;
+			let sawSignal = null;
+			const wiring = {
+				ctx: { get: (n) => (n === "userQuestions" ? silentAnswerer((req) => { sawSignal = req.signal; }) : undefined) },
+				settings: resolveSettings({ confirmInput: true, confirmTimeoutSeconds: 1 }).settings,
+				userQuestions: null
+			};
+			const started = Date.now();
+			const wired = withConsent(wiring, "type_text", () => { ran += 1; return "ran"; });
+			await assert.rejects(() => wired({ text: "hi" }, execFor({ id: "s-timeout" })), /等待同意超时/, "超时应拒绝");
+			const elapsed = Date.now() - started;
+			assert.ok(elapsed >= 900, `应该真的等满 1 秒，实际 ${elapsed}ms`);
+			assert.ok(elapsed < 4000, `不该等太久，实际 ${elapsed}ms`);
+			assert.equal(ran, 0, "超时拒绝时绝不能执行");
+			// 必须把问题撤回：否则弹窗会一直挂在界面上，而这边早已按超时给了结论
+			assert.ok(sawSignal !== null, "应把 signal 交给 answerer");
+			assert.equal(sawSignal.aborted, true, "超时后必须撤回问题（abort signal）");
+			assert.equal(sessionGrants.size, 0, "超时不该留下会话授权");
+			ok("等待超时 + 默认设置 → 拒绝，且真的等满了窗口、撤回了问题");
+		}
+
+		// ② 超时 + 放行 → 执行
+		{
+			sessionGrants.clear();
+			let ran = 0;
+			const wiring = {
+				ctx: { get: (n) => (n === "userQuestions" ? silentAnswerer() : undefined) },
+				settings: resolveSettings({
+					confirmInput: true, confirmTimeoutSeconds: 1, confirmAllowOnTimeout: true
+				}).settings,
+				userQuestions: null
+			};
+			const wired = withConsent(wiring, "mouse_click", () => { ran += 1; return "ran"; });
+			assert.equal(await wired({ x: 1, y: 2 }, execFor({ id: "s-timeout" })), "ran");
+			assert.equal(ran, 1, "配置成放行时应当执行");
+			// 关键：没有人同意过，绝不能留下会话授权
+			assert.equal(sessionGrants.size, 0, "超时放行也绝不能留下会话授权");
+			// 面板要能看到「我不在时它自己动过手」的次数
+			const state = buildState({
+				settings: wiring.settings, registeredTools: [], ctx: wiring.ctx, configError: null
+			});
+			assert.equal(state.consent.allowOnTimeout, true);
+			assert.equal(state.consent.timeoutAllows, 1, "超时放行必须计数，否则事后毫无痕迹");
+			ok("等待超时 + 「超时后放行」→ 执行，且计数可见（但绝不记会话授权）");
+		}
+
+		// ③ 等待秒数 = 0 → 不超时，绝不按超时策略自作主张
+		{
+			sessionGrants.clear();
+			let ran = 0;
+			const wiring = {
+				ctx: { get: (n) => (n === "userQuestions"
+					? { async ask() { return { answers: [{ id: "x", selected: [CONSENT_DENY] }] }; } }
+					: undefined) },
+				settings: resolveSettings({ confirmInput: true, confirmTimeoutSeconds: 0 }).settings,
+				userQuestions: null
+			};
+			const wired = withConsent(wiring, "key", () => { ran += 1; return "ran"; });
+			await assert.rejects(() => wired({ combo: "ctrl+a" }, execFor({ id: "s1" })), /被用户拒绝/);
+			assert.equal(ran, 0);
+			ok("等待秒数 = 0 → 不超时（结论仍来自回答本身）");
+		}
+
+		// ④ 调用方中止（工具超时 / 用户取消）不能被当成「等待超时」
+		{
+			sessionGrants.clear();
+			let ran = 0;
+			const controller = new AbortController();
+			const wiring = {
+				ctx: { get: (n) => (n === "userQuestions" ? silentAnswerer() : undefined) },
+				// 故意配成「超时放行」：如果实现把调用方中止误当成等待超时，这里就会执行
+				settings: resolveSettings({
+					confirmInput: true, confirmTimeoutSeconds: 60, confirmAllowOnTimeout: true
+				}).settings,
+				userQuestions: null
+			};
+			const wired = withConsent(wiring, "scroll", () => { ran += 1; return "ran"; });
+			const pending = wired(
+				{ deltaY: -120 },
+				{ agent: { session: { header: { id: "s1" } } }, callId: "c", signal: controller.signal }
+			);
+			setTimeout(() => controller.abort(), 30);
+			await assert.rejects(() => pending, /无法向人类征求同意/,
+				"调用方中止应走「问不到人」那条，而不是超时策略");
+			assert.equal(ran, 0, "调用方中止时绝不能执行 —— 否则工具超时就成了绕过闸门的后门");
+			ok("调用方中止 ≠ 等待超时：不会被误当成「超时后放行」");
+		}
+	}
+
 	// ── 会话 id 的展示短名：真机验证时测出来的 bug ──
 	{
 		// 真实会话 id 形如 session-<uuid>。直接截前 8 位只会得到 "session-" 这个
@@ -570,13 +692,55 @@ console.log("\n[11] 注册态：工具真的带了闸门");
 	const byName = (n) => host.tools.find((t) => t.name === n);
 	const exec = { agent: { session: { header: { id: "s1" } } }, callId: "c1", signal: undefined };
 
+	// 开着闸门时，工具超时必须**长于**闸门的等待窗口 —— 否则工具先被掐断，
+	// 「超时后放行」这个策略永远轮不到执行机会。
+	const WAIT_S = resolveSettings({}).settings.confirmTimeoutSeconds;
 	for (const n of ["window_activate", "mouse_click", "type_text", "key", "scroll"]) {
-		assert.equal(byName(n).timeoutMs, CONFIRM_TIMEOUT_MS, `${n} 的 timeoutMs 应顶到上限`);
+		assert.equal(
+			byName(n).timeoutMs,
+			WAIT_S * 1000 + CONFIRM_TIMEOUT_SLACK_MS,
+			`${n} 的 timeoutMs 应为「等待窗口 + 余量」`
+		);
 	}
 	for (const n of ["window_list", "screenshot"]) {
-		assert.notEqual(byName(n).timeoutMs, CONFIRM_TIMEOUT_MS, `${n} 是只读的，不该被改动`);
+		assert.notEqual(byName(n).timeoutMs, WAIT_S * 1000 + CONFIRM_TIMEOUT_SLACK_MS,
+			`${n} 是只读的，不该被改动`);
 	}
-	ok("开着闸门：五个输入工具的超时顶到上限，只读两个不受影响");
+	ok(`开着闸门：五个输入工具的超时 = 等待窗口(${WAIT_S}s) + 余量，只读两个不受影响`);
+
+	// 「不超时」：等待秒数填 0，要给一个「一直等」的量
+	{
+		const host2 = makeHost();
+		host2.ctx.userQuestions = { async ask() { return { answers: [{ id: "x", selected: [CONSENT_DENY] }] }; } };
+		host2.ctx.get = (n) => {
+			if (n === "tools") return host2.ctx.tools;
+			if (n === "webServer") return host2.ctx.webServer;
+			if (n === "userQuestions") return host2.ctx.userQuestions;
+			return undefined;
+		};
+		apply(host2.ctx, { confirmInput: true, confirmTimeoutSeconds: 0 });
+		await until(() => host2.routes.length === 3 && host2.tools.length === 7);
+		const t = (n) => host2.tools.find((x) => x.name === n);
+		assert.equal(t("type_text").timeoutMs, CONFIRM_WAIT_FOREVER_MS, "0 = 不超时，给「一直等」的量");
+		assert.ok(CONFIRM_WAIT_FOREVER_MS > 3600 * 1000, "「一直等」至少得是一小时量级");
+		ok("等待秒数 = 0（不超时）→ 工具超时变成「一直等」");
+		for (const d of host2.disposers) if (typeof d === "function") d();
+	}
+
+	// 关掉闸门时超时必须回到各工具原本的值，一个字节都不多
+	{
+		const host3 = makeHost();
+		apply(host3.ctx, { confirmInput: false });
+		await until(() => host3.routes.length === 3 && host3.tools.length === 7);
+		const t = (n) => host3.tools.find((x) => x.name === n);
+		assert.equal(t("type_text").timeoutMs, 15000);
+		assert.equal(t("mouse_click").timeoutMs, 10000);
+		assert.equal(t("key").timeoutMs, 10000);
+		assert.equal(t("scroll").timeoutMs, 10000);
+		assert.equal(t("window_activate").timeoutMs, 10000);
+		ok("闸门关闭 → 超时回到各工具原本的值（无额外行为）");
+		for (const d of host3.disposers) if (typeof d === "function") d();
+	}
 
 	assert.match(byName("type_text").description, /pauses for the user's approval/);
 	assert.doesNotMatch(byName("screenshot").description, /pauses for the user's approval/);

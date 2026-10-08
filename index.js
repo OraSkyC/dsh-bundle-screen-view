@@ -78,6 +78,21 @@ const DEFAULTS = {
 	 * 与 DSH 的审批策略（ask / never）无关，因此不受本会话 policy: never 的影响。
 	 */
 	confirmInput: false,
+	/**
+	 * 等待用户回答的秒数。0 = 不超时（一直等）。
+	 *
+	 * 注意这不是「工具超时」，而是**闸门自己的等待窗口**。开着闸门时工具超时会被
+	 * 自动设成比它更长 —— 否则工具先被掐断，「超时后怎么处理」这个策略永远轮不到生效。
+	 */
+	confirmTimeoutSeconds: 300,
+	/**
+	 * 等待超时后是否放行。默认 false = 拒绝（fail closed）。
+	 *
+	 * 设成 true 意味着：**你不回话，智能体就自己动你的键鼠。**
+	 * 这是明显的 fail-open，只适合「我可能不在，但信得过它」的场景；
+	 * 面板会为此给一条显眼的警告。它只在 confirmTimeoutSeconds > 0 时有意义。
+	 */
+	confirmAllowOnTimeout: false,
 	/** 截图默认最大宽度（像素）；超出等比缩小。 */
 	captureMaxWidth: 2560,
 	/** 图片引用 LRU 上限：render() 靠它把像素交给模型。 */
@@ -114,13 +129,26 @@ const CONSENT_DENY = '不允许';
 const CONSENT_QUESTION_ID = 'desktop-input-consent';
 
 /**
- * 开着闸门时输入工具的 timeoutMs。
+ * 等待秒数为 0（不超时）时给工具的 timeoutMs：相当于「一直等」。
  *
- * 人在回路里，等待时间必须给够：原来 10~15 秒的超时会在用户还没看清弹窗时
- * 就把调用掐掉。600000 是宿主对工具超时的上限（它把审批等待也算在内），
- * 这里直接顶到上限。超时仍然等于「没拿到同意」，所以是 fail closed。
+ * 好消息是工具超时**没有全局上限** —— `dsh-tool-call-timeout-policy` 的文档写着
+ * 「Each tool supplies its own limit; the package has no configuration」。
+ * 所以我早先抄 run_code schema 里的 600000 并不是宿主限制，24 小时是真的等得起。
+ * 它只是兜底，免得真出现一个永远挂着、白白占住会话的调用。
  */
-const CONFIRM_TIMEOUT_MS = 600000;
+const CONFIRM_WAIT_FOREVER_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * 工具超时相对「同意等待窗口」多出来的余量。
+ *
+ * 必须让**闸门自己先决定**（按配置放行或拒绝），而不是让工具超时抢先生效 ——
+ * 否则「超时后放行」这个策略永远轮不到执行机会。
+ */
+const CONFIRM_TIMEOUT_SLACK_MS = 60000;
+
+/** 同意等待秒数的上下界。 */
+const CONFIRM_WAIT_MIN_S = 0;
+const CONFIRM_WAIT_MAX_S = 86400;
 
 /** 确认弹窗里展示调用参数时的截断长度。 */
 const CONFIRM_PREVIEW_MAX = 400;
@@ -132,6 +160,16 @@ const CONFIRM_PREVIEW_MAX = 400;
  * 一个能跨重启活下来的鼠标键盘授权不是用户点那个按钮时想要的东西。
  */
 const sessionGrants = new Map();
+
+/**
+ * 因等待超时而被放行的次数（进程内累计）。
+ *
+ * 「超时后放行」最危险的地方在于**它是静默的**：人不回话，事情照样发生，
+ * 事后没有任何痕迹能看出来「这次没人看过」。所以面板上给一个计数，
+ * 让用户回来时至少能看到「我不在的时候它自己走了几次」。
+ * 不落盘：重启即清零，与「本会话」的记忆语义一致。
+ */
+let timeoutAllows = 0;
 
 /** 只允许标题包含这些子串的窗口被操作（空数组 = 不限制）。 */
 const trimString = (value, fallback = '') => (typeof value === 'string' ? value.trim() : fallback);
@@ -157,6 +195,16 @@ function resolveSettings(raw = {}) {
 		if (!Number.isFinite(parsed)) return fallback;
 		return Math.min(Math.max(Math.round(parsed), min), max);
 	};
+	// 必须放在 clampInt 之后：它是 const 箭头函数，提前用会踩 TDZ
+	out.confirmTimeoutSeconds = clampInt(
+		source.confirmTimeoutSeconds,
+		DEFAULTS.confirmTimeoutSeconds,
+		CONFIRM_WAIT_MIN_S,
+		CONFIRM_WAIT_MAX_S
+	);
+	out.confirmAllowOnTimeout = typeof source.confirmAllowOnTimeout === 'boolean'
+		? source.confirmAllowOnTimeout
+		: DEFAULTS.confirmAllowOnTimeout;
 	out.captureMaxWidth = clampInt(source.captureMaxWidth, DEFAULTS.captureMaxWidth, CAPTURE_WIDTH_MIN, CAPTURE_WIDTH_MAX);
 	out.imageCacheSize = clampInt(source.imageCacheSize, DEFAULTS.imageCacheSize, IMAGE_CACHE_MIN, IMAGE_CACHE_MAX_LIMIT);
 
@@ -385,6 +433,32 @@ function describeGrantGap(sessionId, parentId) {
 }
 
 /**
+ * 等待超时后的结论。
+ *
+ * 默认**拒绝**（fail closed）：没人回答就不做。
+ * 配成放行就是「你不回话，智能体就自己动你的键鼠」—— 明显的 fail-open，
+ * 面板上会为此给一条显眼的警告，面板的状态区还会显示已经这样放行过几次。
+ *
+ * 两种结果都**不记会话授权**：没有任何人同意过，不该留下长期许可。
+ * @param {object} settings - 已归一化的配置。
+ * @param {string} toolName
+ * @returns {{ok: boolean, via?: string, error?: string}}
+ */
+function timeoutVerdict(settings, toolName) {
+	if (settings.confirmAllowOnTimeout === true) {
+		timeoutAllows += 1;
+		return { ok: true, via: 'timeout' };
+	}
+	return {
+		ok: false,
+		error:
+			`${toolName} 被拒绝：等待同意超时（${settings.confirmTimeoutSeconds} 秒内没有人回答），` +
+			'按当前设置视为不同意，没有执行任何操作。不要重试；' +
+			'请让用户自己完成这一步，或让用户把面板里的「超时后放行」打开（那意味着你不回话它就自己做）。',
+	};
+}
+
+/**
  * 征求一次同意，返回是否放行。
  *
  * 用 `ctx.userQuestions` 而不是 DSH 原生的 `ctx.approval`：原生那套的结果词汇表是
@@ -411,6 +485,32 @@ async function requestInputConsent(wiring, exec, toolName, args) {
 		};
 	}
 
+	// 自己控制 signal：既能跟随调用方的中止（工具超时 / 用户取消），
+	// 也能在等待超时后把问题撤回 —— 否则弹窗会一直挂在界面上，
+	// 而这边早已按超时策略给出了结论，用户再点就成了「迟到的回答」。
+	const controller = typeof AbortController === 'function' ? new AbortController() : null;
+	const relayAbort = () => {
+		try {
+			controller?.abort();
+		} catch {
+			/* 已经中止过就算了 */
+		}
+	};
+	if (controller !== null && exec?.signal !== undefined) {
+		if (exec.signal.aborted === true) controller.abort();
+		else exec.signal.addEventListener?.('abort', relayAbort, { once: true });
+	}
+
+	const waitSeconds = wiring.settings.confirmTimeoutSeconds;
+	let timedOut = false;
+	let timer = null;
+	if (waitSeconds > 0) {
+		timer = setTimeout(() => {
+			timedOut = true;
+			relayAbort();
+		}, waitSeconds * 1000);
+	}
+
 	let answer;
 	try {
 		answer = await userQuestions.ask({
@@ -420,7 +520,9 @@ async function requestInputConsent(wiring, exec, toolName, args) {
 				question:
 					'智能体要执行一次桌面输入操作：\n\n' +
 					`${toolName}\n${describeInputCall(toolName, args)}\n\n` +
-					'允许吗？',
+					`允许吗？（${waitSeconds > 0
+						? `${waitSeconds} 秒内不回答按「${wiring.settings.confirmAllowOnTimeout === true ? '允许' : '不允许'}」处理`
+						: '会一直等你回答'}）`,
 				options: [
 					{ label: CONSENT_ALLOW_ONCE, description: '只放行这一次，下次还会再问' },
 					{ label: CONSENT_ALLOW_SESSION, description: '本会话内不再询问；可在插件设置里撤销' },
@@ -428,18 +530,23 @@ async function requestInputConsent(wiring, exec, toolName, args) {
 				],
 			}],
 			...(exec?.agent === undefined ? {} : { agent: exec.agent }),
-			signal: exec?.signal,
+			signal: controller === null ? exec?.signal : controller.signal,
 			...(exec?.callId === undefined ? {} : { wait: { callId: exec.callId } }),
 		});
 	} catch (error) {
-		// 子智能体（被别的 agent 拥有）→ DELEGATED_CALLER；没有 answerer → NO_PROVIDER。
-		// 两种都必须拒绝：问不到人就不做。
+		// 是我们自己的定时器中止的 → 按「超时后怎么处理」的配置给结论
+		if (timedOut) return timeoutVerdict(wiring.settings, toolName);
+		// 真正问不到人：子智能体（被别的 agent 拥有）→ DELEGATED_CALLER；
+		// 没有 answerer → NO_PROVIDER。两种都必须拒绝：问不到人就不做。
 		const reason = error?.message ?? String(error);
 		return {
 			ok: false,
 			error: `${toolName} 被拒绝：无法向人类征求同意（${reason}）。` +
 				describeGrantGap(sessionId, parentId),
 		};
+	} finally {
+		if (timer !== null) clearTimeout(timer);
+		exec?.signal?.removeEventListener?.('abort', relayAbort);
 	}
 
 	const choice = readConsentChoice(answer);
@@ -473,9 +580,13 @@ function withConsent(wiring, toolName, run) {
 	};
 }
 
-/** 输入工具的 timeoutMs：开着闸门时顶到上限，给人留出反应时间。 */
+/** 输入工具的 timeoutMs：开着闸门时按等待窗口算，并留出余量。 */
 function inputTimeoutMs(wiring, base) {
-	return wiring.settings.confirmInput === true ? CONFIRM_TIMEOUT_MS : base;
+	if (wiring.settings.confirmInput !== true) return base;
+	const wait = wiring.settings.confirmTimeoutSeconds;
+	// 不超时（0）就给一个「一直等」的量；否则等满等待窗口再留出余量，
+	// 让闸门自己先按配置决定，而不是被工具超时抢先生效。
+	return wait > 0 ? wait * 1000 + CONFIRM_TIMEOUT_SLACK_MS : CONFIRM_WAIT_FOREVER_MS;
 }
 
 /** 开着闸门时追加到输入工具描述后面的一句，让模型知道调用会先停下来等人。 */
@@ -950,7 +1061,12 @@ function buildState(wiring) {
 			service: resolveUserQuestions(wiring) !== null,
 			tools: CONFIRM_TOOLS.slice(),
 			grants: grantList(),
-			timeoutMs: CONFIRM_TIMEOUT_MS,
+			/** 等待窗口的秒数；0 = 不超时。 */
+			timeoutSeconds: wiring.settings.confirmTimeoutSeconds,
+			/** 超时后是否放行（fail-open，默认 false）。 */
+			allowOnTimeout: wiring.settings.confirmAllowOnTimeout === true,
+			/** 已经因为超时而放行过几次 —— 这是「我不在时它自己动过手」的唯一痕迹。 */
+			timeoutAllows,
 		},
 	};
 }
@@ -1171,8 +1287,11 @@ function apply(ctx, config = {}) {
 }
 
 export {
-	CONFIRM_TIMEOUT_MS,
+	CONFIRM_TIMEOUT_SLACK_MS,
 	CONFIRM_TOOLS,
+	CONFIRM_WAIT_FOREVER_MS,
+	CONFIRM_WAIT_MAX_S,
+	CONFIRM_WAIT_MIN_S,
 	CONSENT_ALLOW_ONCE,
 	CONSENT_ALLOW_SESSION,
 	CONSENT_DENY,
@@ -1203,6 +1322,7 @@ export {
 	sessionGrants,
 	shortSessionId,
 	stateDirectory,
+	timeoutVerdict,
 	toolNames,
 	withConsent,
 };

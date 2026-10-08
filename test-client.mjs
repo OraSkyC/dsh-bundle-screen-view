@@ -334,7 +334,7 @@ console.log("\n[D] 文案键对齐");
 		ConsentStatus({
 			data: {
 				consent: {
-					confirmInput: true, service: true, timeoutMs: 600000,
+					confirmInput: true, service: true, timeoutSeconds: 300, allowOnTimeout: false, timeoutAllows: 0,
 					tools: ["window_activate", "mouse_click", "type_text", "key", "scroll"],
 					grants: [{ id: "abcdef123456", short: "abcdef12", at: Date.now() }]
 				}
@@ -397,7 +397,7 @@ console.log("\n[F] 面板：安全闸门与状态（端到端）");
 		imageCacheSize: 3,
 		platform: "win32",
 		consent: {
-			confirmInput: false, service: true, timeoutMs: 600000,
+			confirmInput: false, service: true, timeoutSeconds: 300, allowOnTimeout: false, timeoutAllows: 0,
 			tools: ["window_activate", "mouse_click", "type_text", "key", "scroll"],
 			grants: []
 		}
@@ -460,7 +460,7 @@ console.log("\n[F] 面板：安全闸门与状态（端到端）");
 		assert.match(json, /1 个会话/, "应显示已授权的会话数");
 		assert.match(json, /abcdef12/, "应显示授权的短 id");
 		assert.match(json, /撤销全部授权/, "应给出撤销入口");
-		assert.match(json, /600 秒/, "应显示等待上限");
+		assert.match(json, /300 秒后视为不同意/, "应把等待策略说成人话（超时视为不同意）");
 		ok("闸门开启 → 提示改成已启用，并渲染授权状态与撤销入口");
 		reactApi.teardown();
 	}
@@ -549,13 +549,95 @@ console.log("\n[F] 面板：安全闸门与状态（端到端）");
 		assert.ok(!json.includes("输入控制已开启"), "停用时不应再显示输入警告");
 		// 停用后其余闸门应被禁用
 		const switches = findButtons(tree).filter((b) => b.props?.role === "switch");
-		assert.equal(switches.length, 4, `应有 4 个开关，实际 ${switches.length}`);
+		assert.equal(switches.length, 5, `应有 5 个开关，实际 ${switches.length}`);
 		assert.equal(switches.find((b) => b.props["aria-label"] === "启用插件").props.disabled, false);
 		assert.equal(switches.find((b) => b.props["aria-label"] === "允许截屏与列窗口").props.disabled, true);
 		assert.equal(switches.find((b) => b.props["aria-label"] === "允许操作鼠标与键盘").props.disabled, true);
 		assert.equal(switches.find((b) => b.props["aria-label"] === "操作前征求同意").props.disabled, true);
+		assert.equal(switches.find((b) => b.props["aria-label"] === "超时后放行").props.disabled, true);
 		ok("enabled=false → 显示停用提示，其余闸门被禁用");
 		reactApi.teardown();
+	}
+
+	{
+		// 「超时后放行」的禁用联动：等待秒数为 0 时它没有意义（永远不会超时）
+		const neverTimesOut = {
+			...base,
+			effective: {
+				...base.effective, confirmInput: true, confirmTimeoutSeconds: 0, confirmAllowOnTimeout: false
+			},
+			consent: { ...base.consent, confirmInput: true, timeoutSeconds: 0 }
+		};
+		const { reactApi, tree } = await mountWith(neverTimesOut);
+		const switches = findButtons(tree).filter((b) => b.props?.role === "switch");
+		assert.equal(
+			switches.find((b) => b.props["aria-label"] === "超时后放行").props.disabled,
+			true,
+			"等待秒数为 0 时「超时后放行」应禁用（永远不会超时）"
+		);
+		assert.match(JSON.stringify(tree), /不超时，一直等你回答/, "应说明等待策略是不超时");
+		reactApi.teardown();
+
+		// 有等待窗口时它应当可用
+		const withWindow = {
+			...base,
+			effective: {
+				...base.effective, confirmInput: true, confirmTimeoutSeconds: 120, confirmAllowOnTimeout: false
+			},
+			consent: { ...base.consent, confirmInput: true, timeoutSeconds: 120 }
+		};
+		const second = await mountWith(withWindow);
+		const sw2 = findButtons(second.tree).filter((b) => b.props?.role === "switch");
+		assert.equal(
+			sw2.find((b) => b.props["aria-label"] === "超时后放行").props.disabled,
+			false,
+			"有等待窗口时应可切换"
+		);
+		assert.match(JSON.stringify(second.tree), /120 秒后视为不同意/, "默认是超时视为不同意");
+		second.reactApi.teardown();
+		ok("「超时后放行」的启用/禁用联动与等待策略文案正确");
+	}
+
+	{
+		// fail-open 必须显眼：红底警告 + 策略文案改成「放行」+ 计数可见
+		const allowState = {
+			...base,
+			effective: {
+				...base.effective, confirmInput: true, confirmTimeoutSeconds: 60, confirmAllowOnTimeout: true
+			},
+			consent: {
+				...base.consent, confirmInput: true, timeoutSeconds: 60,
+				allowOnTimeout: true, timeoutAllows: 3
+			}
+		};
+		const { reactApi, tree } = await mountWith(allowState);
+		const json = JSON.stringify(tree);
+		assert.match(json, /「超时后放行」已打开/, "必须有显眼警告");
+		assert.match(json, /60 秒后放行/, "等待策略要写清是放行");
+		assert.ok(!json.includes("60 秒后视为不同意"), "不该同时出现两种说法");
+		assert.match(json, /已因超时放行/, "要显示超时放行的次数");
+		assert.match(json, /3 次/, "次数要对");
+		// 用红底而不是黄底：这是 fail-open，不该和普通提示一个份量
+		const box = (() => {
+			let found;
+			const walk = (n) => {
+				if (found !== undefined || n === null || typeof n !== "object") return;
+				const text = (n.children ?? []).filter((c) => typeof c === "string").join("");
+				if (text.includes("「超时后放行」已打开")) { found = n; return; }
+				for (const c of n.children ?? []) walk(c);
+			};
+			walk(tree);
+			return found;
+		})();
+		assert.ok(box !== undefined, "找不到那条警告");
+		// noticeBad 的底是 bg-layer-2，错误色在边与文字上 —— 断言要看整条 style
+		assert.match(JSON.stringify(box.props.style), /state-error-primary/,
+			"fail-open 的警告应当用错误色");
+		assert.doesNotMatch(JSON.stringify(box.props.style), /state-warn-primary/,
+			"不该只是普通的黄色提示 —— fail-open 要更重");
+		assert.equal(box.props.role, "alert", "应当是 alert 而不是普通 status");
+		reactApi.teardown();
+		ok("开着「超时后放行」→ 红底警告 + 策略文案改成放行 + 超时放行次数可见");
 	}
 
 	{
@@ -614,7 +696,7 @@ console.log("\n[H] 保存后界面立即同步（回归）");
 		registeredTools: ["window_list", "screenshot", "window_activate", "mouse_click", "type_text", "key", "scroll"],
 		imageCacheSize: 3,
 		platform: "win32",
-		consent: { confirmInput: false, service: true, timeoutMs: 600000, tools: [], grants: [] }
+		consent: { confirmInput: false, service: true, timeoutSeconds: 300, allowOnTimeout: false, timeoutAllows: 0, tools: [], grants: [] }
 	};
 
 	/**
@@ -654,7 +736,7 @@ console.log("\n[H] 保存后界面立即同步（回归）");
 			effective: { ...initialEffective, allowInput: false },
 			tools: ["window_list", "screenshot"],
 			registeredTools: ["window_list", "screenshot"],
-			consent: { confirmInput: false, service: true, timeoutMs: 600000, grants: [] }
+			consent: { confirmInput: false, service: true, timeoutSeconds: 300, allowOnTimeout: false, timeoutAllows: 0, grants: [] }
 		}, calls);
 
 		assert.equal(switchFor(mounted.tree, "允许操作鼠标与键盘").props["aria-checked"], true, "初始应为开");
@@ -685,7 +767,7 @@ console.log("\n[H] 保存后界面立即同步（回归）");
 			effective: { ...initialEffective, captureMaxWidth: 8192 },
 			tools: initial.tools,
 			registeredTools: initial.registeredTools,
-			consent: { confirmInput: false, service: true, timeoutMs: 600000, grants: [] }
+			consent: { confirmInput: false, service: true, timeoutSeconds: 300, allowOnTimeout: false, timeoutAllows: 0, grants: [] }
 		}, calls);
 
 		const field = inputFor(mounted.tree, "截图最大宽度（像素）");
@@ -720,7 +802,7 @@ console.log("\n[H] 保存后界面立即同步（回归）");
 		const calls = [];
 		const mounted = await mountWithSettings({
 			effective: initialEffective, tools: initial.tools, registeredTools: initial.registeredTools,
-			consent: { confirmInput: false, service: true, timeoutMs: 600000, grants: [] }
+			consent: { confirmInput: false, service: true, timeoutSeconds: 300, allowOnTimeout: false, timeoutAllows: 0, grants: [] }
 		}, calls);
 		globalThis.fetch = async (path, init) => {
 			const p = String(path);

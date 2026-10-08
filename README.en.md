@@ -194,7 +194,8 @@ Every failure path of the gate **denies**; none of them fall through to "never m
 | You pick "Deny" | Denied; the tool errors |
 | The answer is unrecognisable (unknown option, skipped, free text only) | Denied |
 | The host exposes no `userQuestions` service | Denied, with the reason stated |
-| Nobody answers until the tool times out | Denied (wait limit 10 minutes) |
+| Nobody answers until the wait times out | **Denied** by default; allowed only if you explicitly turn on "allow when it times out" |
+| The tool times out / you cancel the call (caller abort) | Denied — this is **not** a wait timeout, see below |
 | The caller is a subagent and the main session never granted | Denied |
 
 That last one needs explaining: **a subagent cannot raise a human prompt itself.** DSH's
@@ -207,6 +208,42 @@ session.
 > Known boundary: inheritance only looks up one level (`parentSession`). Deeper descendants get no
 > grant and are denied — better to deny than to leave a bypass in the gate.
 
+### Wait timeout
+
+Two settings:
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `confirmTimeoutSeconds` | `300` | How long to wait for an answer. **`0` = no timeout** — it waits for you indefinitely. Range 0–86400. |
+| `confirmAllowOnTimeout` | `false` | Whether a timeout allows the action. `false` (default) means a timeout counts as **denial**. |
+
+**`confirmAllowOnTimeout: true` is fail-open.** It means:
+
+> If you do not answer, the agent drives your mouse and keyboard by itself.
+
+I only do that when you explicitly turn it on, and the panel shows it as an **error-coloured alert**
+(every other notice is amber). Two more boundaries:
+
+- **An allow on timeout never records a session grant.** Nobody consented, so no standing permission
+  is created; it applies to that one call only.
+- **The panel shows "allowed on timeout N times".** The trouble with timeout-allows is that they are
+  silent: you are away, things happen anyway, and nothing afterwards reveals it. That counter is your
+  only clue when you come back.
+
+#### "Wait timeout" and "tool timeout" are two different things
+
+While the gate is on, the input tools' `timeoutMs` is set to **wait window + 60s**
+(24 hours when the wait window is 0, i.e. "wait forever"). The gate has to reach its own conclusion
+from the configuration first, otherwise the tool timeout cuts the call off and
+"allow when it times out" never gets a chance to run.
+
+Conversely, **a caller abort (tool timeout, you cancelling the call) must never be treated as a wait
+timeout**. Conflating the two would mean that with "allow when it times out" on, a tool timeout alone
+would buy an allowance — turning the tool timeout into a back door around the gate. A dedicated test
+watches for this.
+
+When it gives up waiting, the gate **withdraws the prompt** so no question lingers in the UI after the
+decision has already been made by timeout.
 ### Why not DSH's native `ctx.approval`
 
 DSH does have an approval seam, but its outcome vocabulary is fixed:
@@ -313,7 +350,7 @@ dsh-bundle-screen-view/
 
 ```bash
 npm run check     # syntax-check all five files
-npm test          # 54 host assertion groups + 28 client assertion groups
+npm test          # 61 host assertion groups + 30 client assertion groups
 ```
 
 The tests cover config normalisation, the four safety gates, window exclusion, the sparse override

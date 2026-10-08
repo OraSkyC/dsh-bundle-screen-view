@@ -84,18 +84,27 @@ var dsh_bundle_screen_view_client = (function () {
 		"field.excludeWindowTitlesHint": "逗号分隔，大小写不敏感。标题命中的窗口不会出现在 window_list 里，也不能被截图或操作 —— 用来挡住密码管理器、网银这类窗口。留空则不排除。",
 		"field.confirmInput": "操作前征求同意",
 		"field.confirmInputHint": "开启后，五个输入工具每次调用都会先停下来问你一次：允许本次操作 / 允许本次会话所有操作 / 不允许。这是本插件自己的闸门，不受 DSH 审批策略影响，默认关闭。",
+		"field.confirmTimeoutSeconds": "等待多少秒",
+		"field.confirmTimeoutSecondsHint": "超过这个时间没人回答，就按下面那条策略处理。填 0 = 不超时，会一直等你回答（那个工具调用可能长时间挂住）。",
+		"field.confirmAllowOnTimeout": "超时后放行",
+		"field.confirmAllowOnTimeoutHint": "默认关闭 = 超时视为不同意。打开后：你不回话，智能体就自己动你的键鼠 —— 这是 fail-open，只适合「我可能不在，但信得过它」的场景。等待秒数为 0 时这一项没有意义。",
 		"warn.inputOn": "输入控制已开启：智能体可以真的移动你的鼠标、按键、打字。当前没有开启「操作前征求同意」—— 权限允许时会直接执行，不会弹窗。",
 		"warn.inputOnConfirm": "输入控制已开启，且已启用「操作前征求同意」：五个输入工具每次调用都会先停下来问你，可选「允许本次操作」「允许本次会话所有操作」「不允许」。",
 		"warn.inputOff": "输入控制已关闭：智能体只能看，不能动。",
 		"warn.nonWindows": "当前系统不是 Windows，这些工具依赖 user32.dll / gdi32.dll，调用会失败。",
 		"warn.noService": "宿主没有提供 userQuestions 服务，此刻开启这个闸门会让五个输入工具全部失败（拿不到同意就不执行）。请先确认 DSH 装好了 user-questions 能力。",
+		"warn.timeoutAllow": "「超时后放行」已打开：超过等待时间没人回答时，智能体会直接执行这次输入，而你不会收到任何提示。你不在的时候，它可以一直这样动你的键鼠。",
 		"consent.grants": "本会话已授权",
 		"consent.grantsNone": "无 —— 每次输入都会问你",
 		"consent.grantsValue": "{count} 个会话",
 		"consent.grantList": "授权明细",
 		"consent.grantDetail": "{short}… · {time}",
-		"consent.timeout": "等待上限",
-		"consent.timeoutValue": "{seconds} 秒（超时同样视为不同意）",
+		"consent.timeout": "等待策略",
+		"consent.timeoutNever": "不超时，一直等你回答",
+		"consent.timeoutDeny": "{seconds} 秒后视为不同意",
+		"consent.timeoutAllow": "{seconds} 秒后放行",
+		"consent.timeoutAllows": "已因超时放行",
+		"consent.timeoutAllowsValue": "{count} 次（你不回话时它自己动的）",
 		"consent.tools": "受闸门保护的工具",
 		"consent.revoke": "撤销全部授权",
 		"consent.revoking": "撤销中…",
@@ -149,18 +158,27 @@ var dsh_bundle_screen_view_client = (function () {
 		"field.excludeWindowTitlesHint": "Comma separated, case-insensitive. Matching windows are hidden from window_list and cannot be captured or operated — use it to keep password managers and banking windows out. Empty means no exclusions.",
 		"field.confirmInput": "Ask before acting",
 		"field.confirmInputHint": "When on, each of the five input tools pauses and asks you first: allow once / allow for this session / deny. This is the plugin's own gate, independent of DSH's approval policy. Off by default.",
+		"field.confirmTimeoutSeconds": "Wait this many seconds",
+		"field.confirmTimeoutSecondsHint": "If nobody answers within this time, the policy below applies. 0 means no timeout — it waits for you indefinitely (that tool call may hang for a long while).",
+		"field.confirmAllowOnTimeout": "Allow when it times out",
+		"field.confirmAllowOnTimeoutHint": "Off by default, meaning a timeout counts as a denial. When on: if you do not answer, the agent goes ahead and drives your mouse and keyboard itself — that is fail-open, only fit for \"I may be away but I trust it\". Meaningless when the wait is 0.",
 		"warn.inputOn": "Input control is ON: the agent can really move your mouse, press keys and type. \"Ask before acting\" is currently OFF, so it will act whenever permission allows, without prompting.",
 		"warn.inputOnConfirm": "Input control is ON and \"Ask before acting\" is enabled: each of the five input tools pauses and asks you first — allow once, allow for this session, or deny.",
 		"warn.inputOff": "Input control is OFF: the agent can look but not touch.",
 		"warn.nonWindows": "This is not Windows. These tools rely on user32.dll / gdi32.dll and will fail.",
 		"warn.noService": "The host exposes no userQuestions service, so enabling this gate right now would make all five input tools fail (no consent, no action). Make sure the user-questions capability is installed first.",
+		"warn.timeoutAllow": "\"Allow when it times out\" is ON: if nobody answers within the wait, the agent performs that input anyway and you get no notice. While you are away it can keep doing that to your mouse and keyboard.",
 		"consent.grants": "Sessions you allowed",
 		"consent.grantsNone": "none — every input will ask",
 		"consent.grantsValue": "{count} session(s)",
 		"consent.grantList": "Grants",
 		"consent.grantDetail": "{short}… · {time}",
-		"consent.timeout": "Wait limit",
-		"consent.timeoutValue": "{seconds}s (a timeout also counts as a denial)",
+		"consent.timeout": "Timeout policy",
+		"consent.timeoutNever": "no timeout — waits for you indefinitely",
+		"consent.timeoutDeny": "counts as a denial after {seconds}s",
+		"consent.timeoutAllow": "allowed after {seconds}s",
+		"consent.timeoutAllows": "Allowed on timeout",
+		"consent.timeoutAllowsValue": "{count} time(s) — it acted while nobody answered",
 		"consent.tools": "Tools behind the gate",
 		"consent.revoke": "Revoke all grants",
 		"consent.revoking": "Revoking…",
@@ -716,7 +734,14 @@ var dsh_bundle_screen_view_client = (function () {
 		const consent = data && data.consent ? data.consent : {};
 		const grants = Array.isArray(consent.grants) ? consent.grants : [];
 		const service = consent.service === true;
-		const timeoutSeconds = typeof consent.timeoutMs === "number" ? Math.round(consent.timeoutMs / 1000) : 0;
+		const timeoutSeconds = typeof consent.timeoutSeconds === "number" ? consent.timeoutSeconds : 0;
+		const allowOnTimeout = consent.allowOnTimeout === true;
+		const timeoutAllows = typeof consent.timeoutAllows === "number" ? consent.timeoutAllows : 0;
+		/** 把等待策略说成人话 —— 它是「超时后会发生什么」，不是单纯的秒数。 */
+		const timeoutText = timeoutSeconds <= 0
+			? tt("consent.timeoutNever")
+			: tt(allowOnTimeout ? "consent.timeoutAllow" : "consent.timeoutDeny")
+				.replace("{seconds}", String(timeoutSeconds));
 
 		const revoke = useCallback(async () => {
 			if (busy === true || disabled === true) return;
@@ -765,9 +790,15 @@ var dsh_bundle_screen_view_client = (function () {
 			),
 			h(StatusRow, {
 				label: tt("consent.timeout"),
-				muted: true,
-				value: tt("consent.timeoutValue").replace("{seconds}", String(timeoutSeconds))
+				muted: timeoutSeconds > 0 && !allowOnTimeout,
+				value: timeoutText
 			}),
+			// 超时放行是静默的：人不在，事情照样发生，事后没有任何痕迹。
+			// 所以给一个计数 —— 用户回来时至少能看到「我不在的时候它自己走了几次」。
+			timeoutAllows > 0 ? h(StatusRow, {
+				label: tt("consent.timeoutAllows"),
+				value: tt("consent.timeoutAllowsValue").replace("{count}", String(timeoutAllows))
+			}) : null,
 			h("div", { style: S.fieldGrid },
 				h("div", null, h("div", { style: S.fieldLabel }, tt("consent.revoke"))),
 				h("div", { style: S.fieldControl },
@@ -994,6 +1025,32 @@ var dsh_bundle_screen_view_client = (function () {
 							disabled: disabled || effective.allowInput !== true,
 							tt,
 						}),
+						// 闸门的两个子设置：跟 confirmInput 一起禁用，而不是干脆不显示 ——
+						// 让用户看得见「还有这两个旋钮」，而不是发现不了。
+						h(Field, {
+							name: "confirmTimeoutSeconds",
+							label: tt("field.confirmTimeoutSeconds"),
+							hint: tt("field.confirmTimeoutSecondsHint"),
+							value: effective.confirmTimeoutSeconds,
+							kind: "number",
+							disabled: disabled || effective.confirmInput !== true,
+							tt,
+						}),
+						h(BoolField, {
+							name: "confirmAllowOnTimeout",
+							label: tt("field.confirmAllowOnTimeout"),
+							hint: tt("field.confirmAllowOnTimeoutHint"),
+							value: effective.confirmAllowOnTimeout,
+							// 等待秒数为 0 时它没有意义（永远不会超时）
+							disabled: disabled || effective.confirmInput !== true
+								|| !(typeof effective.confirmTimeoutSeconds === "number"
+									&& effective.confirmTimeoutSeconds > 0),
+							tt,
+						}),
+						// fail-open 必须显眼：别的提示都是黄底，这一条用红底
+						!disabled && effective.confirmInput === true && effective.confirmAllowOnTimeout === true
+							? h("div", { style: S.noticeBad, role: "alert" }, tt("warn.timeoutAllow"))
+							: null,
 						// 警告文案必须跟着闸门状态走。以前这里写死「本插件没有确认后执行机制」，
 						// 加了闸门之后那句话就成了假话 —— 面板上骗人比没有提示更糟。
 						disabled ? null : (effective.allowInput !== true
