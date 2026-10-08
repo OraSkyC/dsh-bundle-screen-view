@@ -1,0 +1,61 @@
+{
+  "name": "dsh-bundle-screen-view",
+  "displayName": "屏幕视野",
+  "description": "Optional DSH bundle that gives the Host desktop tools: window_list and screenshot (read-only), plus window_activate, mouse_click, type_text, key and scroll for driving the real mouse and keyboard.",
+  "version": "1.1.0",
+  "private": true,
+  "icon": "./icon.svg",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./package.json": "./package.json",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./locale/*.json": "./locale/*.json"
+  },
+  "files": [
+    "icon.svg",
+    "locale/*.json",
+    "index.js",
+    "cordis.patch.yml",
+    "lib/capture.js",
+    "lib/input.js",
+    "lib/png.js",
+    "README.md",
+    "README.en.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "check": "node --check index.js && node --check lib/capture.js && node --check lib/input.js && node --check lib/png.js"
+  },
+  "keywords": [
+    "dsh-plugin",
+    "deepseek-harness",
+    "dsh-bundle",
+    "screen-capture",
+    "screenshot",
+    "automation",
+    "win32"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "os": [
+    "win32"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/OraSkyC/dsh-bundle-screen-view.git"
+  },
+  "homepage": "https://github.com/OraSkyC/dsh-bundle-screen-view#readme",
+  "bugs": {
+    "url": "https://github.com/OraSkyC/dsh-bundle-screen-view/issues"
+  },
+  "license": "MIT"
+}

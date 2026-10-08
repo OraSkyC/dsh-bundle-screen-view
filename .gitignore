@@ -1,0 +1,22 @@
+# 依赖与构建产物（本插件无构建步骤、无 npm 依赖）
+node_modules/
+dist/
+*.tgz
+
+# DSH 状态与本地配置
+.dsh/
+state/
+*.local.json
+
+# 截图落盘时的产物（正常情况下走 attachments，不落仓库）
+*.png
+!icon.svg
+
+# 编辑器与系统
+*.log
+*.bak
+*.orig
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

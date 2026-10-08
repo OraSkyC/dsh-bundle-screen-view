@@ -1,0 +1,4 @@
+# Screen View bundle layer: register the desktop screenshot and window-list tools.
+- insert:
+    - id: screen-view
+      name: 'dsh-bundle-screen-view'
