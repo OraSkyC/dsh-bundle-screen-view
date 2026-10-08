@@ -229,6 +229,18 @@ console.log("\n[D] 文案键对齐");
 	const missing = [...used].filter((key) => !(key in zh));
 	assert.deepEqual(missing, [], "缺字典键: " + missing.join(", "));
 	ok(`渲染树引用 ${used.size} 个键，全部在字典中`);
+
+	// 面板把文案当**纯文本**渲染（不是 Markdown），标记只会显示成字面符号。
+	// 真出过一次：风险提示里写了 **没有**，界面上就是四个星号。
+	for (const [lang, dict] of [["zh", zh], ["en", en]]) {
+		for (const [key, value] of Object.entries(dict)) {
+			assert.ok(
+				!value.includes("**") && !value.includes("__"),
+				`${lang} 的 ${key} 含 Markdown 标记，会显示成字面符号：${value}`
+			);
+		}
+	}
+	ok("文案里没有 Markdown 标记（面板是纯文本渲染）");
 }
 
 console.log("\n[E] 端点路径");

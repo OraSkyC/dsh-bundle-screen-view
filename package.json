@@ -2,7 +2,7 @@
   "name": "dsh-bundle-screen-view",
   "displayName": "桌面操控",
   "description": "Optional DSH bundle that gives the Host desktop tools: window_list and screenshot (read-only), plus window_activate, mouse_click, type_text, key and scroll for driving the real mouse and keyboard — with safety gates and a settings card in the Plugins page.",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "private": true,
   "icon": "./icon.svg",
   "type": "module",
