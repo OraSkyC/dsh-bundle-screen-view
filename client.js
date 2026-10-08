@@ -22,6 +22,7 @@ var dsh_bundle_screen_view_client = (function () {
 	const NS = "dsh-bundle-screen-view";
 	const STATE_PATH = "/api/" + NS + "/state";
 	const SETTINGS_PATH = "/api/" + NS + "/settings";
+	const CONSENT_PATH = "/api/" + NS + "/consent";
 
 	/* ------------------------------------------------------------------ */
 	/* 文案                                                                 */
@@ -33,6 +34,7 @@ var dsh_bundle_screen_view_client = (function () {
 		"panel.error": "读取失败：{error}",
 		"panel.updated": "更新于 {time}",
 		"panel.refresh": "刷新",
+		"panel.versionHint": "宿主在激活时把客户端 bundle 读进内存，改完 client.js 需要重启 DSH 才会生效；这个版本号变了就说明新构建已加载。",
 		"panel.configError": "配置有误：{error}",
 		"panel.disabled": "插件已停用：一个工具都不会注册。",
 		"section.status": "状态",
@@ -60,9 +62,26 @@ var dsh_bundle_screen_view_client = (function () {
 		"field.imageCacheSizeHint": "已截图的引用保留多少张，取值范围 {min}–{max}。太小会导致较早的截图无法回传给模型。",
 		"field.excludeWindowTitles": "排除的窗口标题",
 		"field.excludeWindowTitlesHint": "逗号分隔，大小写不敏感。标题命中的窗口不会出现在 window_list 里，也不能被截图或操作 —— 用来挡住密码管理器、网银这类窗口。留空则不排除。",
-		"warn.inputOn": "输入控制已开启：智能体可以真的移动你的鼠标、按键、打字。本插件没有「确认后执行」机制 —— 权限允许时不会弹窗征求同意。",
+		"field.confirmInput": "操作前征求同意",
+		"field.confirmInputHint": "开启后，五个输入工具每次调用都会先停下来问你一次：允许本次操作 / 允许本次会话所有操作 / 不允许。这是本插件自己的闸门，不受 DSH 审批策略影响，默认关闭。",
+		"warn.inputOn": "输入控制已开启：智能体可以真的移动你的鼠标、按键、打字。当前没有开启「操作前征求同意」—— 权限允许时会直接执行，不会弹窗。",
+		"warn.inputOnConfirm": "输入控制已开启，且已启用「操作前征求同意」：五个输入工具每次调用都会先停下来问你，可选「允许本次操作」「允许本次会话所有操作」「不允许」。",
 		"warn.inputOff": "输入控制已关闭：智能体只能看，不能动。",
 		"warn.nonWindows": "当前系统不是 Windows，这些工具依赖 user32.dll / gdi32.dll，调用会失败。",
+		"warn.noService": "宿主没有提供 userQuestions 服务，此刻开启这个闸门会让五个输入工具全部失败（拿不到同意就不执行）。请先确认 DSH 装好了 user-questions 能力。",
+		"consent.grants": "本会话已授权",
+		"consent.grantsNone": "无 —— 每次输入都会问你",
+		"consent.grantsValue": "{count} 个会话",
+		"consent.grantList": "授权明细",
+		"consent.grantDetail": "{short}… · {time}",
+		"consent.timeout": "等待上限",
+		"consent.timeoutValue": "{seconds} 秒（超时同样视为不同意）",
+		"consent.tools": "受闸门保护的工具",
+		"consent.revoke": "撤销全部授权",
+		"consent.revoking": "撤销中…",
+		"consent.revoked": "已撤销 {count} 个会话的授权",
+		"consent.revokeNone": "没有可撤销的授权",
+		"consent.revokeError": "撤销失败：{error}",
 		"action.save": "保存",
 		"action.saving": "保存中…",
 		"action.reset": "恢复默认",
@@ -80,6 +99,7 @@ var dsh_bundle_screen_view_client = (function () {
 		"panel.error": "Failed to load: {error}",
 		"panel.updated": "Updated {time}",
 		"panel.refresh": "Refresh",
+		"panel.versionHint": "The host reads the client bundle into memory at activation, so client.js changes need a DSH restart; a new number here means the new build is loaded.",
 		"panel.configError": "Invalid config: {error}",
 		"panel.disabled": "Plugin disabled: no tools are registered.",
 		"section.status": "Status",
@@ -107,9 +127,26 @@ var dsh_bundle_screen_view_client = (function () {
 		"field.imageCacheSizeHint": "How many screenshot references to keep, {min}–{max}. Too small and older screenshots cannot be handed back to the model.",
 		"field.excludeWindowTitles": "Excluded window titles",
 		"field.excludeWindowTitlesHint": "Comma separated, case-insensitive. Matching windows are hidden from window_list and cannot be captured or operated — use it to keep password managers and banking windows out. Empty means no exclusions.",
-		"warn.inputOn": "Input control is ON: the agent can really move your mouse, press keys and type. This plugin has no confirmation step — it will not ask before acting.",
+		"field.confirmInput": "Ask before acting",
+		"field.confirmInputHint": "When on, each of the five input tools pauses and asks you first: allow once / allow for this session / deny. This is the plugin's own gate, independent of DSH's approval policy. Off by default.",
+		"warn.inputOn": "Input control is ON: the agent can really move your mouse, press keys and type. \"Ask before acting\" is currently OFF, so it will act whenever permission allows, without prompting.",
+		"warn.inputOnConfirm": "Input control is ON and \"Ask before acting\" is enabled: each of the five input tools pauses and asks you first — allow once, allow for this session, or deny.",
 		"warn.inputOff": "Input control is OFF: the agent can look but not touch.",
 		"warn.nonWindows": "This is not Windows. These tools rely on user32.dll / gdi32.dll and will fail.",
+		"warn.noService": "The host exposes no userQuestions service, so enabling this gate right now would make all five input tools fail (no consent, no action). Make sure the user-questions capability is installed first.",
+		"consent.grants": "Sessions you allowed",
+		"consent.grantsNone": "none — every input will ask",
+		"consent.grantsValue": "{count} session(s)",
+		"consent.grantList": "Grants",
+		"consent.grantDetail": "{short}… · {time}",
+		"consent.timeout": "Wait limit",
+		"consent.timeoutValue": "{seconds}s (a timeout also counts as a denial)",
+		"consent.tools": "Tools behind the gate",
+		"consent.revoke": "Revoke all grants",
+		"consent.revoking": "Revoking…",
+		"consent.revoked": "Revoked {count} session grant(s)",
+		"consent.revokeNone": "There was nothing to revoke",
+		"consent.revokeError": "Revoke failed: {error}",
 		"action.save": "Save",
 		"action.saving": "Saving…",
 		"action.reset": "Reset",
@@ -427,6 +464,19 @@ var dsh_bundle_screen_view_client = (function () {
 			fontFamily: "var(--dsw-font-markdown-code-font-family, ui-monospace, monospace)",
 			fontSize: 12,
 			lineHeight: "20px"
+		},
+		grantList: {
+			margin: 0,
+			padding: "0 0 0 2px",
+			listStyle: "none",
+			fontSize: 12,
+			lineHeight: "18px",
+			color: "var(--dsw-alias-label-secondary)"
+		},
+		grantItem: {
+			fontFamily: "var(--dsw-font-markdown-code-font-family, ui-monospace, monospace)",
+			overflowWrap: "anywhere",
+			wordBreak: "break-word"
 		}
 	};
 
@@ -625,6 +675,90 @@ var dsh_bundle_screen_view_client = (function () {
 		);
 	}
 
+	/**
+	 * 「操作前征求同意」的运行状态与撤销入口。
+	 *
+	 * 只在闸门开启时渲染 —— 关着的时候这一整块没有意义。
+	 * 撤销按钮做得不吓人是有意的：撤销授权是往**安全**方向走，
+	 * 真正危险的动作在弹窗里那个「允许」上，不在这个面板里。
+	 */
+	function ConsentStatus({ data, disabled, tt, onChanged }) {
+		const [busy, setBusy] = useState(false);
+		const [message, setMessage] = useState(null);
+		const [error, setError] = useState(null);
+
+		const consent = data && data.consent ? data.consent : {};
+		const grants = Array.isArray(consent.grants) ? consent.grants : [];
+		const service = consent.service === true;
+		const timeoutSeconds = typeof consent.timeoutMs === "number" ? Math.round(consent.timeoutMs / 1000) : 0;
+
+		const revoke = useCallback(async () => {
+			if (busy === true || disabled === true) return;
+			setBusy(true);
+			setError(null);
+			setMessage(null);
+			try {
+				const body = await postJsonOrThrow(CONSENT_PATH, {});
+				setMessage(body.revoked > 0
+					? tt("consent.revoked").replace("{count}", String(body.revoked))
+					: tt("consent.revokeNone"));
+				if (typeof onChanged === "function") await onChanged();
+			} catch (reason) {
+				setError(tt("consent.revokeError").replace(
+					"{error}", reason instanceof Error ? reason.message : String(reason)));
+			} finally {
+				setBusy(false);
+			}
+		}, [busy, disabled, tt, onChanged]);
+
+		return h("div", null,
+			// 服务不可用是个真问题：此刻开着闸门会让五个输入工具全部失败，必须显眼地说
+			service ? null : h("div", { style: S.noticeWarn, role: "status" }, tt("warn.noService")),
+			h(StatusRow, {
+				label: tt("consent.tools"),
+				value: Array.isArray(consent.tools) && consent.tools.length > 0
+					? consent.tools.join(" · ")
+					: tt("status.toolsNone"),
+				muted: true
+			}),
+			h(StatusRow, {
+				label: tt("consent.grants"),
+				value: grants.length === 0
+					? tt("consent.grantsNone")
+					: tt("consent.grantsValue").replace("{count}", String(grants.length))
+			}),
+			grants.length === 0 ? null : h("div", { style: S.fieldGrid },
+				h("div", null, h("div", { style: S.fieldLabel }, tt("consent.grantList"))),
+				h("div", { style: S.fieldControl },
+					h("ul", { style: S.grantList }, grants.map((grant) =>
+						h("li", { key: String(grant.id), style: S.grantItem },
+							tt("consent.grantDetail")
+								.replace("{short}", String(grant.short ?? ""))
+								.replace("{time}", clock(grant.at)))))
+				)
+			),
+			h(StatusRow, {
+				label: tt("consent.timeout"),
+				muted: true,
+				value: tt("consent.timeoutValue").replace("{seconds}", String(timeoutSeconds))
+			}),
+			h("div", { style: S.fieldGrid },
+				h("div", null, h("div", { style: S.fieldLabel }, tt("consent.revoke"))),
+				h("div", { style: S.fieldControl },
+					h("div", { style: { ...S.fieldActions, marginTop: 0 } },
+						h(Button, {
+							disabled: disabled === true || busy === true || grants.length === 0,
+							onClick: () => revoke(),
+							label: tt("consent.revoke")
+						}, busy ? tt("consent.revoking") : tt("consent.revoke")),
+						message ? h("span", { style: S.saved }, message) : null
+					),
+					error ? h("div", { style: { ...S.error, marginTop: 6 }, role: "alert" }, error) : null
+				)
+			)
+		);
+	}
+
 	/* ------------------------------------------------------------------ */
 	/* 面板主体                                                             */
 	/* ------------------------------------------------------------------ */
@@ -709,7 +843,15 @@ var dsh_bundle_screen_view_client = (function () {
 		return h("div", { style: S.page },
 			h("div", { style: S.header },
 				h("div", { style: S.titleBlock },
-					h("h2", { style: S.title }, tt("panel.title")),
+					h("h2", { style: S.title },
+						tt("panel.title"),
+						// 版本号在这里是有用的：宿主把客户端 bundle 在激活时读进内存，
+						// 改完 client.js 不重启 DSH 看不到新界面。版本号一变就说明新构建生效了。
+						data && data.plugin && data.plugin.version
+							? h("span", { style: S.versionChip, title: tt("panel.versionHint") },
+								"v" + data.plugin.version)
+							: null
+					),
 					h("p", { style: S.subtitle }, tt("panel.subtitle"))
 				),
 				h("div", { style: S.cluster },
@@ -785,9 +927,23 @@ var dsh_bundle_screen_view_client = (function () {
 							disabled: disabled,
 							tt
 						}),
-						disabled ? null : (effective.allowInput === true
-							? h("div", { style: S.noticeWarn, role: "status" }, tt("warn.inputOn"))
-							: h("div", { style: S.noticeOk, role: "status" }, tt("warn.inputOff")))
+						h(BoolField, {
+							name: "confirmInput",
+							label: tt("field.confirmInput"),
+							hint: tt("field.confirmInputHint"),
+							value: effective.confirmInput,
+							disabled: disabled || effective.allowInput !== true,
+							tt
+						}),
+						// 警告文案必须跟着闸门状态走。以前这里写死「本插件没有确认后执行机制」，
+						// 加了闸门之后那句话就成了假话 —— 面板上骗人比没有提示更糟。
+						disabled ? null : (effective.allowInput !== true
+							? h("div", { style: S.noticeOk, role: "status" }, tt("warn.inputOff"))
+							: h("div", { style: S.noticeWarn, role: "status" },
+								tt(effective.confirmInput === true ? "warn.inputOnConfirm" : "warn.inputOn"))),
+						!disabled && effective.allowInput === true && effective.confirmInput === true
+							? h(ConsentStatus, { data, disabled, tt, onChanged: load })
+							: null
 					) : null,
 
 					data && openSections.behavior ? h(SectionCard, {
@@ -889,9 +1045,9 @@ var dsh_bundle_screen_view_client = (function () {
 			panel: Object.freeze({
 				dictionaries: Object.freeze({ zh, en }),
 				styles: S,
-				paths: Object.freeze({ NS, STATE_PATH, SETTINGS_PATH }),
+				paths: Object.freeze({ NS, STATE_PATH, SETTINGS_PATH, CONSENT_PATH }),
 				helpers: Object.freeze({ clock }),
-				components: Object.freeze({ PanelPage, SectionCard, StatusRow, Field, BoolField, Button })
+				components: Object.freeze({ PanelPage, SectionCard, StatusRow, ConsentStatus, Field, BoolField, Button })
 			})
 		};
 	}

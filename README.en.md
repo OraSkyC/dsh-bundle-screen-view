@@ -30,9 +30,15 @@ Before installing, make sure that:
   see "Reducing the risk" below);
 - you do not hand a session with these tools to an untrusted prompt or untrusted page content.
 
-**The plugin itself has no confirmation step** — it will not ask before acting. It does, however,
-provide three **safety gates that take effect immediately** (see "Settings" below). The most
-important one lets you keep the *seeing* and drop the *acting*.
+**It does not prompt by default** — `confirmInput` is off, so it acts whenever permission allows. It
+does provide an **optional per-action consent gate** (turn it on and every input asks you first), plus
+three **safety gates that take effect immediately** (see "Settings" below). The most important one lets
+you keep the *seeing* and drop the *acting*.
+
+> The consent gate has existed since `1.3.0`. Off by default is deliberate: turning it on adds one
+> interruption per click, which suits "occasionally have the agent click something for me". If you have
+> it driving the desktop all day, leave it off and manage access with permission presets instead —
+> see "Reducing the risk".
 
 ## What it does
 
@@ -98,6 +104,7 @@ rather than writing the default back, so the field falls through to the deploy d
 | `enabled` | `true` | Master switch. When off, **no tools are registered at all**; the panel still opens. |
 | `allowCapture` | `true` | Registers `window_list` + `screenshot`. They never touch your mouse, but they do hand screen contents to the model — turn this off on sensitive screens. |
 | `allowInput` | `true` | Registers `window_activate` / `mouse_click` / `type_text` / `key` / `scroll`. **Turn this off to let the agent look but not touch.** |
+| `confirmInput` | `false` | Ask before each input action (three-way choice). Off by default, meaning it acts whenever permission allows. See "Ask before acting". |
 
 ### Behaviour
 
@@ -128,18 +135,113 @@ rather than returning `undefined`. Missing it fails the whole `apply()` and the 
 
 ## Reducing the risk
 
-There are now four layers of control:
+There are now five layers of control:
 
-1. **The plugin's own safety gates** (recommended): turn `allowInput` off in the Plugins page and the
+1. **Ask before acting** (`confirmInput`, off by default): when on, each of the five input tools
+   pauses and asks you first — allow once / allow for this session / deny. There is a section on it
+   below.
+2. **The plugin's own safety gates** (recommended): turn `allowInput` off in the Plugins page and the
    agent is left with seeing only. This is the most direct layer, and it needs no restart.
-2. **Permission presets** — DSH's presets (`read-only` / `workspace-write` / `danger-full-access`)
+3. **Permission presets** — DSH's presets (`read-only` / `workspace-write` / `danger-full-access`)
    decide what a session may do.
-3. **Not installed means not present** — the tools only exist while the plugin is loaded. Uninstall
+4. **Not installed means not present** — the tools only exist while the plugin is loaded. Uninstall
    or disable it once your automation is done.
-4. **Prompt level** — the tool descriptions state "use it only when the user asked you to operate the
+5. **Prompt level** — the tool descriptions state "use it only when the user asked you to operate the
    UI, and prefer targeting one specific window". That constrains the model; it is not enforcement.
 
-**Remember that the plugin has no confirmation step.** Once the tools are available and permissions
+**Note that layer 1 is off by default.** While it is off, and as long as the tools are available and
+permissions allow, the agent calling `mouse_click` will not prompt you for consent.
+
+## Ask before acting
+
+With `confirmInput` on, each protected tool call raises a three-way question through
+`ctx.userQuestions`:
+
+| Option | Effect |
+| --- | --- |
+| **Allow once** | Lets this one call through; the next one asks again |
+| **Allow for this session** | Stops asking for this session. Held in memory only — revocable from the panel, gone when DSH restarts |
+| **Deny** | Nothing happens and the tool returns an error |
+
+The five protected tools are `window_activate`, `mouse_click`, `type_text`, `key` and `scroll`.
+`screenshot` and `window_list` are read-only and are not gated — they do not change system state.
+
+### The prompt shows what is about to happen
+
+The point of asking a human is that the human can judge, so the prompt carries **the actual arguments**
+of this call rather than just a tool name:
+
+```
+The agent wants to perform a desktop input action:
+
+type_text
+Type 24 characters into the currently focused window:
+  rm -rf ./build && pnpm run build
+
+Allow?
+```
+
+`mouse_click` names the coordinates and button, `key` names the combination, `window_activate` names the
+target window title. Text over 400 characters is truncated with the original length noted — otherwise a
+whole article would blow the dialog apart.
+
+### No consent means no action
+
+Every failure path of the gate **denies**; none of them fall through to "never mind, go ahead":
+
+| Situation | Result |
+| --- | --- |
+| You pick "Deny" | Denied; the tool errors |
+| The answer is unrecognisable (unknown option, skipped, free text only) | Denied |
+| The host exposes no `userQuestions` service | Denied, with the reason stated |
+| Nobody answers until the tool times out | Denied (wait limit 10 minutes) |
+| The caller is a subagent and the main session never granted | Denied |
+
+That last one needs explaining: **a subagent cannot raise a human prompt itself.** DSH's
+`userQuestions` admits only a runtime root for human interaction; a child agent owned by a parent has
+no human answerer and would block forever. So a subagent **inherits** instead: if the main session
+already chose "allow for this session", the subagent proceeds; otherwise it is denied. That leaves no
+route for a subagent to bypass the gate, yet does not leave subagents stuck after you have granted the
+session.
+
+> Known boundary: inheritance only looks up one level (`parentSession`). Deeper descendants get no
+> grant and are denied — better to deny than to leave a bypass in the gate.
+
+### Why not DSH's native `ctx.approval`
+
+DSH does have an approval seam, but its outcome vocabulary is fixed:
+
+```ts
+export type ApprovalOutcome = 'allowed-once' | 'rejected' | 'cancelled' | 'unavailable';
+export type ApprovalPolicy  = 'ask' | 'never';
+```
+
+**"Allow once" and "reject" are all there is — no "allow for this session".** That is not an omission
+on my part; it is explicitly deferred upstream: "the outcome vocabulary has `allowed-once` but no
+`allow-always`, remembered rule, revocation, or grant store".
+
+It is also subject to the session approval policy: under `never`, every approval request is
+**deterministically rejected**. Gating on it would mean that with `never` in force, turning the gate on
+would break all five input tools — a gate that does nothing.
+
+`ctx.userQuestions` documents itself as "Use `ctx.userQuestions` when a tool or **permission flow**
+needs a structured answer from the user", supports arbitrary option lists, and is unaffected by the
+approval policy.
+
+The cost is worth stating: going through `userQuestions` skips `ctx.approval`'s audit events
+(`approval/asked` / `approval/decided`), so decisions do not land in DSH's approval log. The plugin
+compensates for visibility with the grant list and revoke button in the panel.
+
+### Revoking a grant
+
+The "Safety gates" section of the panel shows how many sessions are currently allowed (with a short id
+and a timestamp) plus a "Revoke all grants" button. In addition:
+
+- Changing `confirmInput` — in either direction — **clears every grant**, so toggling it off and back on
+  cannot silently inherit the previous permission;
+- Changing any other setting leaves grants alone;
+- Disabling or unloading the plugin clears grants too;
+- Grants live in memory only, so a DSH restart starts from zero.
 allow it, an agent calling `mouse_click` will not pop up a dialog asking you first.
 
 ## Implementation notes
@@ -211,13 +313,19 @@ dsh-bundle-screen-view/
 
 ```bash
 npm run check     # syntax-check all five files
-npm test          # 27 host assertion groups + 20 client assertion groups
+npm test          # 51 host assertion groups + 25 client assertion groups
 ```
 
-The tests cover config normalisation, the three safety gates, window exclusion, the sparse override
-layer and the panel routes, plus panel rendering — including two regression classes that fail
-**silently** in a browser (**are the field labels visible**, and **do the CSS variables actually
-exist**) and therefore can only be caught by an assertion.
+The tests cover config normalisation, the four safety gates, window exclusion, the sparse override
+layer and the panel routes (including the `/consent` revoke path), **every decision and failure path of
+the consent gate** (the three answers are distinguishable, an unrecognisable answer denies, a missing
+`userQuestions` denies, an unanswerable prompt denies, the subagent inheritance rule, and grants being
+cleared the moment `confirmInput` changes), plus panel rendering — including two regression classes
+that fail **silently** in a browser (**are the field labels visible**, and **do the CSS variables
+actually exist**) and therefore can only be caught by an assertion.
+
+> The gate tests only use a **fake `run`** to drive the "allow" paths; genuinely registered tools are
+> only invoked on the "deny" path — otherwise running the suite would really move your mouse.
 
 What these tools do on a **real desktop** (is the capture correct, does the click land on the right
 coordinate) still has to be verified by hand.

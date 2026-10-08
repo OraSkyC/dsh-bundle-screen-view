@@ -1,8 +1,8 @@
 {
   "name": "dsh-bundle-screen-view",
   "displayName": "桌面操控",
-  "description": "Optional DSH bundle that gives the Host desktop tools: window_list and screenshot (read-only), plus window_activate, mouse_click, type_text, key and scroll for driving the real mouse and keyboard — with safety gates and a settings card in the Plugins page.",
-  "version": "1.2.1",
+  "description": "Optional DSH bundle that gives the Host desktop tools: window_list and screenshot (read-only), plus window_activate, mouse_click, type_text, key and scroll for driving the real mouse and keyboard — with safety gates, an opt-in per-action consent prompt (allow once / allow for this session / deny), and a settings card in the Plugins page.",
+  "version": "1.3.0",
   "private": true,
   "icon": "./icon.svg",
   "type": "module",
@@ -51,6 +51,8 @@
     "screen-capture",
     "screenshot",
     "desktop-automation",
+    "consent",
+    "permission",
     "win32"
   ],
   "engines": {

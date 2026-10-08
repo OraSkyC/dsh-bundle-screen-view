@@ -218,13 +218,24 @@ console.log("\n[D] 文案键对齐");
 			else walk(value);
 		}
 	};
-	const { PanelPage, SectionCard, Field, BoolField, StatusRow } = out.panel.components;
+	const { PanelPage, SectionCard, Field, BoolField, StatusRow, ConsentStatus } = out.panel.components;
 	for (const node of [
 		PanelPage({ tt: (k) => k, localeSubscribe: () => () => {} }),
 		SectionCard({ title: "S", open: true, onToggle: () => {}, tt: (k) => k }),
 		StatusRow({ label: "L", value: "V" }),
 		Field({ name: "n", label: "L", value: "v", kind: "text", tt: (k) => k }),
-		BoolField({ name: "n", label: "L", value: true, tt: (k) => k })
+		BoolField({ name: "n", label: "L", value: true, tt: (k) => k }),
+		ConsentStatus({
+			data: {
+				consent: {
+					confirmInput: true, service: true, timeoutMs: 600000,
+					tools: ["window_activate", "mouse_click", "type_text", "key", "scroll"],
+					grants: [{ id: "abcdef123456", short: "abcdef12", at: Date.now() }]
+				}
+			},
+			disabled: false,
+			tt: (k) => k
+		})
 	]) walk(node);
 	const missing = [...used].filter((key) => !(key in zh));
 	assert.deepEqual(missing, [], "缺字典键: " + missing.join(", "));
@@ -245,11 +256,12 @@ console.log("\n[D] 文案键对齐");
 
 console.log("\n[E] 端点路径");
 {
-	const { NS, STATE_PATH, SETTINGS_PATH } = out.panel.paths;
+	const { NS, STATE_PATH, SETTINGS_PATH, CONSENT_PATH } = out.panel.paths;
 	assert.equal(NS, "dsh-bundle-screen-view");
 	assert.equal(STATE_PATH, "/api/dsh-bundle-screen-view/state");
 	assert.equal(SETTINGS_PATH, "/api/dsh-bundle-screen-view/settings");
-	ok(`面板端点: ${STATE_PATH} / ${SETTINGS_PATH}`);
+	assert.equal(CONSENT_PATH, "/api/dsh-bundle-screen-view/consent");
+	ok(`面板端点: ${STATE_PATH} / ${SETTINGS_PATH} / ${CONSENT_PATH}`);
 }
 
 console.log("\n[F] 面板：安全闸门与状态（端到端）");
@@ -270,14 +282,19 @@ console.log("\n[F] 面板：安全闸门与状态（端到端）");
 
 	const base = {
 		ok: true,
-		plugin: { name: "dsh-bundle-screen-view", entry: "screen-view" },
-		effective: { enabled: true, allowCapture: true, allowInput: true, captureMaxWidth: 2560, imageCacheSize: 64, excludeWindowTitles: [] },
-		defaults: { enabled: true, allowCapture: true, allowInput: true, captureMaxWidth: 2560, imageCacheSize: 64, excludeWindowTitles: [] },
+		plugin: { name: "dsh-bundle-screen-view", entry: "screen-view", version: "9.9.9" },
+		effective: { enabled: true, allowCapture: true, allowInput: true, confirmInput: false, captureMaxWidth: 2560, imageCacheSize: 64, excludeWindowTitles: [] },
+		defaults: { enabled: true, allowCapture: true, allowInput: true, confirmInput: false, captureMaxWidth: 2560, imageCacheSize: 64, excludeWindowTitles: [] },
 		configError: null,
 		tools: ["window_list", "screenshot", "window_activate", "mouse_click", "type_text", "key", "scroll"],
 		registeredTools: ["window_list", "screenshot", "window_activate", "mouse_click", "type_text", "key", "scroll"],
 		imageCacheSize: 3,
-		platform: "win32"
+		platform: "win32",
+		consent: {
+			confirmInput: false, service: true, timeoutMs: 600000,
+			tools: ["window_activate", "mouse_click", "type_text", "key", "scroll"],
+			grants: []
+		}
 	};
 
 	{
@@ -306,10 +323,94 @@ console.log("\n[F] 面板：安全闸门与状态（端到端）");
 			"状态区应以 code chip 列出全部 7 个已注册工具"
 		);
 		ok(`状态区以 chip 列出全部 ${chips.length} 个已注册工具`);
+		// 闸门关着的时候，警告必须如实说「不会弹窗」—— 这一条以前写死成
+		// 「本插件没有确认后执行机制」，加了闸门之后那句话就成了假话。
 		assert.match(json, /输入控制已开启/, "allowInput=true 时应显示风险警告");
-		assert.match(json, /没有.*确认后执行|没有\*\*「确认后执行」\*\*机制/, "警告里必须写明没有确认机制");
-		ok("真实数据下面板渲染出标题、三个区块、字段标签、工具列表与风险警告");
+		assert.match(json, /当前没有开启「操作前征求同意」/, "闸门关着时警告必须说明不会弹窗");
+		assert.ok(!json.includes("已启用「操作前征求同意」"), "闸门关着时不该出现已启用的说法");
+		assert.ok(!json.includes("撤销全部授权"), "闸门关着时不该渲染授权区");
+		// 版本小标：面板头部要能看出当前跑的是哪个构建（宿主缓存客户端 bundle 到重启为止）
+		assert.match(json, /"v9\.9\.9"/, "面板应显示宿主报的版本号");
+		assert.match(json, /panel\.versionHint|宿主在激活时把客户端 bundle 读进内存/, "版本小标要有说明");
+		ok("真实数据下面板渲染出标题、版本小标、三个区块、字段标签、工具列表与风险警告");
 		reactApi.teardown();
+	}
+
+	{
+		// 闸门开启：警告换一条，并渲染授权状态区
+		const onState = {
+			...base,
+			effective: { ...base.effective, confirmInput: true },
+			consent: {
+				...base.consent, confirmInput: true,
+				grants: [{ id: "abcdef1234567890", short: "abcdef12", at: Date.now() }]
+			}
+		};
+		const { reactApi, tree } = await mountWith(onState);
+		const json = JSON.stringify(tree);
+		assert.match(json, /已启用「操作前征求同意」/, "闸门开启时应换成已启用的说明");
+		assert.ok(!json.includes("当前没有开启「操作前征求同意」"), "不该同时出现两套说法");
+		assert.match(json, /本会话已授权/, "应显示授权状态");
+		assert.match(json, /1 个会话/, "应显示已授权的会话数");
+		assert.match(json, /abcdef12/, "应显示授权的短 id");
+		assert.match(json, /撤销全部授权/, "应给出撤销入口");
+		assert.match(json, /600 秒/, "应显示等待上限");
+		ok("闸门开启 → 提示改成已启用，并渲染授权状态与撤销入口");
+		reactApi.teardown();
+	}
+
+	{
+		// 闸门开着但宿主没有 userQuestions：必须显著警告，否则五个工具会全部静默失败
+		const noService = {
+			...base,
+			effective: { ...base.effective, confirmInput: true },
+			consent: { ...base.consent, confirmInput: true, service: false }
+		};
+		const { reactApi, tree } = await mountWith(noService);
+		const json = JSON.stringify(tree);
+		assert.match(json, /宿主没有提供 userQuestions 服务/, "服务缺失必须警告");
+		assert.match(json, /拿不到同意就不执行/, "要说明后果");
+		ok("userQuestions 缺失 → 面板明确警告「工具会全部失败」");
+		reactApi.teardown();
+	}
+
+	{
+		// 撤销按钮：没有授权时禁用；有授权时点一下打 POST /consent
+		const calls = [];
+		const onState = {
+			...base,
+			effective: { ...base.effective, confirmInput: true },
+			consent: { ...base.consent, confirmInput: true, grants: [{ id: "abcdef1234567890", short: "abcdef12", at: Date.now() }] }
+		};
+		globalThis.fetch = async (path, init) => {
+			calls.push({ path, body: init && init.body ? JSON.parse(init.body) : null });
+			if (String(path).endsWith("/consent")) {
+				return { ok: true, status: 200, json: async () => ({ ok: true, revoked: 1, grants: [] }) };
+			}
+			return { ok: true, status: 200, json: async () => onState };
+		};
+		const reactApi = freshReact();
+		renderPanel(reactApi, PanelPage, tt);
+		await new Promise((r) => setTimeout(r, 20));
+		let tree = renderPanel(reactApi, PanelPage, tt);
+		const revokeButton = findButtons(tree).find((b) => b.props?.["aria-label"] === "撤销全部授权");
+		assert.ok(revokeButton !== undefined, "应有撤销按钮");
+		assert.equal(revokeButton.props.disabled, false, "有授权时可点");
+		await revokeButton.props.onClick();
+		const consentCall = calls.find((c) => String(c.path).endsWith("/consent"));
+		assert.ok(consentCall !== undefined, "应 POST 到 /consent");
+		assert.deepEqual(consentCall.body, {}, "撤销全部不需要额外参数");
+		tree = renderPanel(reactApi, PanelPage, tt);
+		assert.match(JSON.stringify(tree), /已撤销 1 个会话的授权/, "应报出撤销结果");
+		reactApi.teardown();
+
+		// 没有授权时按钮禁用
+		const noneState = { ...base, effective: { ...base.effective, confirmInput: true }, consent: { ...base.consent, confirmInput: true } };
+		const mounted = await mountWith(noneState);
+		const btn = findButtons(mounted.tree).find((b) => b.props?.["aria-label"] === "撤销全部授权");
+		assert.equal(btn.props.disabled, true, "没有授权时撤销按钮应禁用");
+		mounted.reactApi.teardown();
+		ok("撤销按钮：有授权可点并 POST /consent、报出结果；无授权时禁用");
 	}
 
 	{
@@ -340,13 +441,33 @@ console.log("\n[F] 面板：安全闸门与状态（端到端）");
 		const json = JSON.stringify(tree);
 		assert.match(json, /插件已停用/, "enabled=false 应显示停用提示");
 		assert.ok(!json.includes("输入控制已开启"), "停用时不应再显示输入警告");
-		// 停用后另外两个闸门应被禁用
+		// 停用后其余闸门应被禁用
 		const switches = findButtons(tree).filter((b) => b.props?.role === "switch");
-		assert.equal(switches.length, 3, `应有 3 个开关，实际 ${switches.length}`);
+		assert.equal(switches.length, 4, `应有 4 个开关，实际 ${switches.length}`);
 		assert.equal(switches.find((b) => b.props["aria-label"] === "启用插件").props.disabled, false);
 		assert.equal(switches.find((b) => b.props["aria-label"] === "允许截屏与列窗口").props.disabled, true);
 		assert.equal(switches.find((b) => b.props["aria-label"] === "允许操作鼠标与键盘").props.disabled, true);
+		assert.equal(switches.find((b) => b.props["aria-label"] === "操作前征求同意").props.disabled, true);
 		ok("enabled=false → 显示停用提示，其余闸门被禁用");
+		reactApi.teardown();
+	}
+
+	{
+		// 输入关掉时，征求同意的开关应联动禁用：没有输入可征求什么同意
+		const noInput = {
+			...base,
+			effective: { ...base.effective, allowInput: false, confirmInput: true },
+			registeredTools: ["window_list", "screenshot"]
+		};
+		const { reactApi, tree } = await mountWith(noInput);
+		const switches = findButtons(tree).filter((b) => b.props?.role === "switch");
+		assert.equal(
+			switches.find((b) => b.props["aria-label"] === "操作前征求同意").props.disabled,
+			true,
+			"allowInput=false 时征求同意开关应禁用"
+		);
+		assert.ok(!JSON.stringify(tree).includes("撤销全部授权"), "输入关着时不该渲染授权区");
+		ok("allowInput=false → 征求同意开关联动禁用，授权区不渲染");
 		reactApi.teardown();
 	}
 

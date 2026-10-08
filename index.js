@@ -10,6 +10,7 @@
 //   cordis.patch.yml config  →  deploy defaults (needs a DSH restart)
 //   $DSH_HOME/state/<pkg>/settings.json → sparse user overrides (immediate)
 import { readFile } from 'node:fs/promises';
+import { readFileSync } from 'node:fs';
 import { mkdir, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
@@ -37,6 +38,22 @@ const pkg = 'dsh-bundle-screen-view';
  */
 const inject = ['tools', 'attachments', 'webServer'];
 
+/**
+ * 版本号。从 package.json 读，**不要在代码里再写一遍**。
+ *
+ * 面板标题右边那颗版本小标就是靠它确认「新构建到底有没有被宿主加载」——
+ * 宿主把客户端 bundle 在激活时读进内存，改完 client.js 不重启 DSH 看不到新东西。
+ * 写死就会和 package.json 漂移，那个信号也就废了。
+ */
+const VERSION = (() => {
+	try {
+		const manifest = JSON.parse(readFileSync(new URL('./package.json', import.meta.url), 'utf8'));
+		return typeof manifest.version === 'string' && manifest.version !== '' ? manifest.version : '0.0.0';
+	} catch {
+		return '0.0.0';
+	}
+})();
+
 /* ------------------------------------------------------------------ */
 /* 配置契约                                                            */
 /* ------------------------------------------------------------------ */
@@ -53,6 +70,14 @@ const DEFAULTS = {
 	enabled: true,
 	allowCapture: true,
 	allowInput: true,
+	/**
+	 * 输入类操作前是否征求同意。默认关闭 = 保持原有「权限允许就直接执行」的行为。
+	 *
+	 * 打开后，五个输入工具每次调用都会先用 ctx.userQuestions 弹一个三选一：
+	 * 允许本次操作 / 允许本次会话所有操作 / 不允许。这是插件自己的一层闸门，
+	 * 与 DSH 的审批策略（ask / never）无关，因此不受本会话 policy: never 的影响。
+	 */
+	confirmInput: false,
 	/** 截图默认最大宽度（像素）；超出等比缩小。 */
 	captureMaxWidth: 2560,
 	/** 图片引用 LRU 上限：render() 靠它把像素交给模型。 */
@@ -66,6 +91,47 @@ const CAPTURE_WIDTH_MAX = 8192;
 const IMAGE_CACHE_MIN = 4;
 const IMAGE_CACHE_MAX_LIMIT = 512;
 const EXCLUDE_MAX = 64;
+
+/* ------------------------------------------------------------------ */
+/* 操作前征求同意                                                      */
+/* ------------------------------------------------------------------ */
+
+/**
+ * 受闸门保护的五个输入工具。
+ *
+ * 只盖输入：window_activate 会改焦点（把窗口提到最前也是一次真实的状态改变，
+ * 所以算输入）；screenshot 是只读的，不在这里。
+ */
+const CONFIRM_TOOLS = ['window_activate', 'mouse_click', 'type_text', 'key', 'scroll'];
+
+/**
+ * 三个选项的标签就是**协议**：answerer 会把标签原样回传，我们按标签判定结果。
+ * 认不出的标签一律当拒绝（fail closed），绝不「看不明白就放行」。
+ */
+const CONSENT_ALLOW_ONCE = '允许本次操作';
+const CONSENT_ALLOW_SESSION = '允许本次会话所有操作';
+const CONSENT_DENY = '不允许';
+const CONSENT_QUESTION_ID = 'desktop-input-consent';
+
+/**
+ * 开着闸门时输入工具的 timeoutMs。
+ *
+ * 人在回路里，等待时间必须给够：原来 10~15 秒的超时会在用户还没看清弹窗时
+ * 就把调用掐掉。600000 是宿主对工具超时的上限（它把审批等待也算在内），
+ * 这里直接顶到上限。超时仍然等于「没拿到同意」，所以是 fail closed。
+ */
+const CONFIRM_TIMEOUT_MS = 600000;
+
+/** 确认弹窗里展示调用参数时的截断长度。 */
+const CONFIRM_PREVIEW_MAX = 400;
+
+/**
+ * 会话级授权：sessionId → { at }。
+ *
+ * 只放内存，故意不落盘 —— 「本会话」的语义就该随进程结束而消失，
+ * 一个能跨重启活下来的鼠标键盘授权不是用户点那个按钮时想要的东西。
+ */
+const sessionGrants = new Map();
 
 /** 只允许标题包含这些子串的窗口被操作（空数组 = 不限制）。 */
 const trimString = (value, fallback = '') => (typeof value === 'string' ? value.trim() : fallback);
@@ -84,6 +150,7 @@ function resolveSettings(raw = {}) {
 	out.enabled = typeof source.enabled === 'boolean' ? source.enabled : DEFAULTS.enabled;
 	out.allowCapture = typeof source.allowCapture === 'boolean' ? source.allowCapture : DEFAULTS.allowCapture;
 	out.allowInput = typeof source.allowInput === 'boolean' ? source.allowInput : DEFAULTS.allowInput;
+	out.confirmInput = typeof source.confirmInput === 'boolean' ? source.confirmInput : DEFAULTS.confirmInput;
 
 	const clampInt = (value, fallback, min, max) => {
 		const parsed = typeof value === 'number' && Number.isFinite(value) ? value : Number(value);
@@ -199,6 +266,205 @@ function presentAct(title) {
 
 const INPUT_NOTICE =
 	' This tool drives the real desktop — use it only when the user asked you to operate the UI, and prefer targeting one specific window.';
+
+/* ------------------------------------------------------------------ */
+/* 同意闸门的实现                                                      */
+/* ------------------------------------------------------------------ */
+
+/**
+ * 惰性解析 `userQuestions` 服务。
+ *
+ * 故意**不**声明进 inject：精简宿主上可能没有它，声明成硬依赖会让整个 apply() 失败。
+ * 而 ctx 是受限代理 —— 读一个未声明的属性会抛错而不是返回 undefined，所以必须包 try。
+ * 解析失败不缓存，下次再试（服务可能在 apply() 之后才挂上）。
+ * @returns {object|null} 带 ask() 的服务，或 null。
+ */
+function resolveUserQuestions(wiring) {
+	if (wiring.userQuestions !== null) return wiring.userQuestions;
+	let service = null;
+	try {
+		service = wiring.ctx.get?.('userQuestions') ?? null;
+	} catch {
+		service = null;
+	}
+	if (service === null || service === undefined || typeof service.ask !== 'function') return null;
+	wiring.userQuestions = service;
+	return service;
+}
+
+/**
+ * 这个会话是否已经被授权「本会话所有操作」。
+ *
+ * 子智能体自己问不了人（宿主的 assertLiveRoot 会拒绝被拥有的 agent 发起人类交互），
+ * 所以它靠 parentSession 继承主会话的授权 —— 人已经为本会话点过授权，
+ * 子智能体在这个范围内行动是合理的。没授权的子智能体一律被拒绝（fail closed）。
+ *
+ * 已知边界：只往上认一层。delegationDepth 更深的后代不在覆盖范围内，会被拒绝 ——
+ * 宁可拒绝也不能给闸门留一条绕过路径。要支持任意深度得沿 parentSession 链逐级解析。
+ * @param {object|undefined} header - exec.agent.session.header
+ * @returns {boolean}
+ */
+function isSessionGranted(header) {
+	if (header === undefined || header === null) return false;
+	const id = header.id === undefined || header.id === null ? '' : String(header.id);
+	if (id !== '' && sessionGrants.has(id)) return true;
+	if (header.origin === 'subagent' && header.parentSession !== undefined && header.parentSession !== null) {
+		return sessionGrants.has(String(header.parentSession));
+	}
+	return false;
+}
+
+/** 从答案里读出三选一。认不出来的一律当拒绝 —— 绝不「看不明白就放行」。 */
+function readConsentChoice(answer) {
+	const first = Array.isArray(answer?.answers) ? answer.answers[0] : undefined;
+	if (first === undefined || first === null) return 'deny';
+	const selected = (Array.isArray(first.selected) ? first.selected : [])
+		.map((entry) => String(entry).trim());
+	if (selected.includes(CONSENT_ALLOW_SESSION)) return 'session';
+	if (selected.includes(CONSENT_ALLOW_ONCE)) return 'once';
+	// 用户在输入框里自己打字而不是点选项（custom），或直接跳过了这一问 → 不算同意
+	return 'deny';
+}
+
+/**
+ * 给人类看的调用摘要。
+ *
+ * 这是确认弹窗里唯一能让人做出判断的信息，所以必须具体到「要打什么字、点哪里」。
+ * 模型看得见工具参数，人看不见 —— 只写一个工具名等于逼人盲签。
+ * @param {string} toolName
+ * @param {object} args
+ * @returns {string}
+ */
+function describeInputCall(toolName, args) {
+	const a = args !== null && typeof args === 'object' ? args : {};
+	const clip = (value) => {
+		const text = String(value ?? '');
+		return text.length > CONFIRM_PREVIEW_MAX
+			? `${text.slice(0, CONFIRM_PREVIEW_MAX)}…（共 ${text.length} 字符）`
+			: text;
+	};
+	switch (toolName) {
+		case 'window_activate':
+			return `激活标题包含 "${clip(a.window)}" 的窗口（会把它提到最前）`;
+		case 'mouse_click':
+			return `把鼠标移到 (${a.x}, ${a.y}) 并点击：${a.button ?? 'left'} ×${a.clicks ?? 1}`;
+		case 'type_text': {
+			const text = typeof a.text === 'string' ? a.text : '';
+			const shown = clip(text).replace(/\r/g, '').replace(/\n/g, '\n  ');
+			return `向当前焦点窗口输入 ${text.length} 个字符：\n  ${shown}`;
+		}
+		case 'key':
+			return `按下按键：${clip(a.combo)}`;
+		case 'scroll':
+			return Number.isInteger(a.x)
+				? `滚动 deltaY=${a.deltaY}（先把光标移到 ${a.x}, ${a.y}）`
+				: `在当前光标位置滚动 deltaY=${a.deltaY}`;
+		default:
+			return clip(JSON.stringify(a));
+	}
+}
+
+/**
+ * 征求一次同意，返回是否放行。
+ *
+ * 用 `ctx.userQuestions` 而不是 DSH 原生的 `ctx.approval`：原生那套的结果词汇表是
+ * `allowed-once | rejected | cancelled | unavailable`，**没有**「允许本会话」，
+ * 而且它受会话审批策略约束（policy 为 never 时一律确定性拒绝，闸门会变成废的）。
+ * userQuestions 的文档明确它可用于权限流程，且支持任意选项列表。
+ * @returns {Promise<{ok: boolean, via?: string, error?: string}>}
+ */
+async function requestInputConsent(wiring, exec, toolName, args) {
+	const header = exec?.agent?.session?.header;
+	if (isSessionGranted(header)) return { ok: true, via: 'session' };
+	const sessionId = header === undefined || header.id === undefined ? '' : String(header.id);
+
+	const userQuestions = resolveUserQuestions(wiring);
+	if (userQuestions === null) {
+		return {
+			ok: false,
+			error:
+				`${toolName} 被拒绝：confirmInput 已开启，但宿主没有可用的 userQuestions 服务，无法征求同意。` +
+				'拿不到同意就不执行（fail closed）。请在插件设置里确认，或关掉 confirmInput。',
+		};
+	}
+
+	let answer;
+	try {
+		answer = await userQuestions.ask({
+			questions: [{
+				id: CONSENT_QUESTION_ID,
+				header: '桌面操控 · 需要确认',
+				question:
+					'智能体要执行一次桌面输入操作：\n\n' +
+					`${toolName}\n${describeInputCall(toolName, args)}\n\n` +
+					'允许吗？',
+				options: [
+					{ label: CONSENT_ALLOW_ONCE, description: '只放行这一次，下次还会再问' },
+					{ label: CONSENT_ALLOW_SESSION, description: '本会话内不再询问；可在插件设置里撤销' },
+					{ label: CONSENT_DENY, description: '拒绝这次输入，不做任何操作' },
+				],
+			}],
+			...(exec?.agent === undefined ? {} : { agent: exec.agent }),
+			signal: exec?.signal,
+			...(exec?.callId === undefined ? {} : { wait: { callId: exec.callId } }),
+		});
+	} catch (error) {
+		// 子智能体（被别的 agent 拥有）→ DELEGATED_CALLER；没有 answerer → NO_PROVIDER。
+		// 两种都必须拒绝：问不到人就不做。
+		const reason = error?.message ?? String(error);
+		return {
+			ok: false,
+			error:
+				`${toolName} 被拒绝：无法向人类征求同意（${reason}）。` +
+				(sessionId === ''
+					? ''
+					: ` 会话 ${sessionId.slice(0, 8)} 还没拿到「${CONSENT_ALLOW_SESSION}」授权，` +
+						'而子智能体自己弹不出窗问人。'),
+		};
+	}
+
+	const choice = readConsentChoice(answer);
+	if (choice === 'once') return { ok: true, via: 'once' };
+	if (choice === 'session') {
+		if (sessionId !== '') sessionGrants.set(sessionId, { at: Date.now() });
+		return { ok: true, via: 'session' };
+	}
+	return {
+		ok: false,
+		error:
+			`${toolName} 被用户拒绝，没有执行任何操作。不要重试；` +
+			'请让用户自己完成这一步，或先征得同意再调用。',
+	};
+}
+
+/**
+ * 把输入工具的 execute 包上同意闸门。
+ * confirmInput 关闭时直接透传 —— 行为与没有这个功能时逐字节一致。
+ * @param {object} wiring
+ * @param {string} toolName
+ * @param {Function} run - 原来的 execute(args, exec)
+ * @returns {Function}
+ */
+function withConsent(wiring, toolName, run) {
+	return async function execute(args, exec) {
+		if (wiring.settings.confirmInput !== true) return run(args, exec);
+		const verdict = await requestInputConsent(wiring, exec, toolName, args);
+		if (verdict.ok !== true) throw new Error(verdict.error);
+		return run(args, exec);
+	};
+}
+
+/** 输入工具的 timeoutMs：开着闸门时顶到上限，给人留出反应时间。 */
+function inputTimeoutMs(wiring, base) {
+	return wiring.settings.confirmInput === true ? CONFIRM_TIMEOUT_MS : base;
+}
+
+/** 开着闸门时追加到输入工具描述后面的一句，让模型知道调用会先停下来等人。 */
+function consentNotice(wiring) {
+	if (wiring.settings.confirmInput !== true) return '';
+	return ' This call pauses for the user\'s approval first (allow once / allow for this session / deny);'
+		+ ' a denial means nothing happened — do not retry it.';
+}
 
 /**
  * Register the desktop tools the current settings allow: two read-only
@@ -346,7 +612,7 @@ function registerTools(ctx, wiring) {
 		ctx.tools.register({
 			name: 'window_activate',
 			description:
-				'Bring a window to the foreground on the local machine, given a case-insensitive substring of its title (restoring it first if minimized). Use it before type_text or key so input lands in the right window, or when the user asks you to focus a window. Frontmost title match wins.' + INPUT_NOTICE,
+				'Bring a window to the foreground on the local machine, given a case-insensitive substring of its title (restoring it first if minimized). Use it before type_text or key so input lands in the right window, or when the user asks you to focus a window. Frontmost title match wins.' + INPUT_NOTICE + consentNotice(wiring),
 			parameters: {
 				type: 'object',
 				properties: {
@@ -364,8 +630,8 @@ function registerTools(ctx, wiring) {
 				],
 			},
 			presentCall: (args) => presentAct(`Activate window "${args?.window ?? '?'}"`),
-			timeoutMs: 10000,
-			execute(args) {
+			timeoutMs: inputTimeoutMs(wiring, 10000),
+			execute: withConsent(wiring, 'window_activate', (args) => {
 				const needle = typeof args?.window === 'string' ? args.window.trim() : '';
 				if (!needle) throw new Error('window_activate requires a "window" title substring');
 				const api = getApi();
@@ -385,14 +651,14 @@ function registerTools(ctx, wiring) {
 				}
 				activateWindow(win.hwnd);
 				return { hwnd: win.hwnd, title: win.title };
-			},
+			}),
 		}),
 	);
 	if (wantInput) unregisters.push(
 		ctx.tools.register({
 			name: 'mouse_click',
 			description:
-				'Move the mouse to (x, y) in virtual-screen pixels (0,0 = top-left of the primary monitor) and click. button: left | right | middle (default left); clicks 1-3 (2 = double-click, default 1). Find coordinates from screenshot output and window_list rectangles. This really moves the user\'s cursor and clicks.' + INPUT_NOTICE,
+				'Move the mouse to (x, y) in virtual-screen pixels (0,0 = top-left of the primary monitor) and click. button: left | right | middle (default left); clicks 1-3 (2 = double-click, default 1). Find coordinates from screenshot output and window_list rectangles. This really moves the user\'s cursor and clicks.' + INPUT_NOTICE + consentNotice(wiring),
 			parameters: {
 				type: 'object',
 				properties: {
@@ -418,8 +684,8 @@ function registerTools(ctx, wiring) {
 			},
 			presentCall: (args) =>
 				presentAct(`Click ${args?.button ?? 'left'} at (${args?.x}, ${args?.y})`),
-			timeoutMs: 10000,
-			execute(args) {
+			timeoutMs: inputTimeoutMs(wiring, 10000),
+			execute: withConsent(wiring, 'mouse_click', (args) => {
 				const x = args?.x;
 				const y = args?.y;
 				if (!Number.isInteger(x) || !Number.isInteger(y)) {
@@ -429,14 +695,14 @@ function registerTools(ctx, wiring) {
 				const clicks = Number.isInteger(args?.clicks) ? args.clicks : 1;
 				clickAt(x, y, button, clicks);
 				return { x, y, button, clicks };
-			},
+			}),
 		}),
 	);
 	if (wantInput) unregisters.push(
 		ctx.tools.register({
 			name: 'type_text',
 			description:
-				'Type the given text into the currently focused window (Unicode input events, any language). Activate the target window with window_activate first if input must land somewhere specific. This really types on the user\'s desktop.' + INPUT_NOTICE,
+				'Type the given text into the currently focused window (Unicode input events, any language). Activate the target window with window_activate first if input must land somewhere specific. This really types on the user\'s desktop.' + INPUT_NOTICE + consentNotice(wiring),
 			parameters: {
 				type: 'object',
 				properties: {
@@ -455,22 +721,22 @@ function registerTools(ctx, wiring) {
 				const short = t.length > 32 ? `${t.slice(0, 32)}…` : t.replace(/\n/g, '↵');
 				return presentAct(`Type "${short}"`);
 			},
-			timeoutMs: 15000,
-			execute(args) {
+			timeoutMs: inputTimeoutMs(wiring, 15000),
+			execute: withConsent(wiring, 'type_text', (args) => {
 				const text = args?.text;
 				if (typeof text !== 'string' || text.length === 0) {
 					throw new Error('type_text requires a non-empty "text" string');
 				}
 				typeText(text);
 				return { chars: text.length };
-			},
+			}),
 		}),
 	);
 	if (wantInput) unregisters.push(
 		ctx.tools.register({
 			name: 'key',
 			description:
-				'Press a key or key combination on the local desktop, e.g. "enter", "tab", "ctrl+a", "ctrl+shift+t", "alt+f4", "f5". Supported keys: a-z, 0-9, f1-f24, enter, tab, esc, backspace, delete, insert, home, end, pageup, pagedown, left, up, right, down, space, shift, ctrl, alt, win. Modifiers go down in order, up in reverse. This really presses keys on the user\'s desktop.' + INPUT_NOTICE,
+				'Press a key or key combination on the local desktop, e.g. "enter", "tab", "ctrl+a", "ctrl+shift+t", "alt+f4", "f5". Supported keys: a-z, 0-9, f1-f24, enter, tab, esc, backspace, delete, insert, home, end, pageup, pagedown, left, up, right, down, space, shift, ctrl, alt, win. Modifiers go down in order, up in reverse. This really presses keys on the user\'s desktop.' + INPUT_NOTICE + consentNotice(wiring),
 			parameters: {
 				type: 'object',
 				properties: {
@@ -485,20 +751,20 @@ function registerTools(ctx, wiring) {
 				],
 			},
 			presentCall: (args) => presentAct(`Press ${args?.combo ?? '?'}`),
-			timeoutMs: 10000,
-			execute(args) {
+			timeoutMs: inputTimeoutMs(wiring, 10000),
+			execute: withConsent(wiring, 'key', (args) => {
 				const combo = typeof args?.combo === 'string' ? args.combo.trim() : '';
 				if (!combo) throw new Error('key requires a "combo" like "ctrl+a"');
 				pressKey(combo);
 				return { combo };
-			},
+			}),
 		}),
 	);
 	if (wantInput) unregisters.push(
 		ctx.tools.register({
 			name: 'scroll',
 			description:
-				'Scroll the page or window under the mouse cursor. Give x,y (virtual-screen pixels) to move the cursor there first; omit them to scroll at the current cursor position. deltaY: wheel units, +120 = one notch up, negative = down (e.g. -240 = two notches down). This really scrolls the user\'s desktop.' + INPUT_NOTICE,
+				'Scroll the page or window under the mouse cursor. Give x,y (virtual-screen pixels) to move the cursor there first; omit them to scroll at the current cursor position. deltaY: wheel units, +120 = one notch up, negative = down (e.g. -240 = two notches down). This really scrolls the user\'s desktop.' + INPUT_NOTICE + consentNotice(wiring),
 			parameters: {
 				type: 'object',
 				properties: {
@@ -525,8 +791,8 @@ function registerTools(ctx, wiring) {
 						? `Scroll ${args.deltaY} at (${args.x}, ${args.y})`
 						: `Scroll ${args?.deltaY ?? '?'} at cursor`,
 				),
-			timeoutMs: 10000,
-			execute(args) {
+			timeoutMs: inputTimeoutMs(wiring, 10000),
+			execute: withConsent(wiring, 'scroll', (args) => {
 				const deltaY = args?.deltaY;
 				if (!Number.isInteger(deltaY) || deltaY === 0) {
 					throw new Error('scroll requires a non-zero integer deltaY (120 = one notch)');
@@ -538,7 +804,7 @@ function registerTools(ctx, wiring) {
 				}
 				scrollAt(x, y, deltaY);
 				return { x, y, deltaY, moved: x !== undefined };
-			},
+			}),
 		}),
 	);
 	return () => {
@@ -554,6 +820,8 @@ function registerTools(ctx, wiring) {
 
 const STATE_PATH = `/api/${pkg}/state`;
 const SETTINGS_PATH = `/api/${pkg}/settings`;
+/** 撤销会话级授权。 */
+const CONSENT_PATH = `/api/${pkg}/consent`;
 const NO_CACHE = { 'cache-control': 'no-store' };
 const MAX_BODY_BYTES = 8192;
 
@@ -619,12 +887,19 @@ function toolNames(settings) {
 	return names;
 }
 
+/** 会话授权的可序列化视图，最新在前。 */
+function grantList() {
+	return [...sessionGrants.entries()]
+		.map(([id, meta]) => ({ id, short: id.slice(0, 8), at: meta.at }))
+		.sort((left, right) => right.at - left.at);
+}
+
 /** 组装只读状态快照。面板与工具读同一份口径。 */
 function buildState(wiring) {
 	return {
 		ok: true,
 		now: Date.now(),
-		plugin: { name: pkg, entry: name },
+		plugin: { name: pkg, entry: name, version: VERSION },
 		effective: { ...wiring.settings },
 		defaults: { ...DEFAULTS },
 		configError: wiring.configError,
@@ -632,6 +907,14 @@ function buildState(wiring) {
 		registeredTools: wiring.registeredTools.slice(),
 		imageCacheSize: imageCache.size,
 		platform: process.platform,
+		consent: {
+			confirmInput: wiring.settings.confirmInput === true,
+			/** 宿主有没有可用的 userQuestions：没有的话开着闸门会让输入工具全部失败。 */
+			service: resolveUserQuestions(wiring) !== null,
+			tools: CONFIRM_TOOLS.slice(),
+			grants: grantList(),
+			timeoutMs: CONFIRM_TIMEOUT_MS,
+		},
 	};
 }
 
@@ -683,6 +966,7 @@ function registerRoutes(ctx, wiring) {
 			return writeJson(response, 400, { ok: false, error: `未知字段 '${field}'` });
 		}
 		try {
+			const beforeConsent = wiring.settings.confirmInput === true;
 			const next = await wiring.store.mutate((current) => {
 				const copy = { ...current };
 				if (value === null) delete copy[field];
@@ -692,6 +976,9 @@ function registerRoutes(ctx, wiring) {
 			const { settings, configError } = resolveSettings({ ...wiring.patchConfig, ...next });
 			wiring.settings = settings;
 			wiring.configError = configError;
+			// 闸门配置一变就清掉已有的会话授权：改配置 = 重新开始。
+			// 不清的话，把 confirmInput 关掉再打开，上一次点的「本会话允许」会悄悄接着生效。
+			if ((settings.confirmInput === true) !== beforeConsent) sessionGrants.clear();
 			// 安全闸门改动后立刻重挂工具，不需要重启
 			syncTools(wiring);
 			writeJson(response, 200, {
@@ -701,6 +988,35 @@ function registerRoutes(ctx, wiring) {
 				configError,
 				tools: toolNames(settings),
 				registeredTools: wiring.registeredTools.slice(),
+				consent: {
+					confirmInput: settings.confirmInput === true,
+					service: resolveUserQuestions(wiring) !== null,
+					grants: grantList(),
+					timeoutMs: CONFIRM_TIMEOUT_MS,
+				},
+			});
+		} catch (error) {
+			writeJson(response, 500, { ok: false, error: error?.message ?? String(error) });
+		}
+	});
+
+	// 撤销会话级授权。默认撤销全部；给了 sessionId 就只撤那一个。
+	const onConsent = register(CONSENT_PATH, async (request, response) => {
+		if (!isAdmitted(request)) return writeJson(response, 403, { ok: false, error: '禁止：来源不匹配' });
+		if (request.method !== undefined && request.method !== 'POST') {
+			return writeJson(response, 405, { ok: false, error: '方法不允许' });
+		}
+		const body = await readJsonBody(request);
+		if (!body.ok) return writeJson(response, 400, { ok: false, error: body.error });
+		const sessionId = typeof body.value.sessionId === 'string' ? body.value.sessionId.trim() : '';
+		try {
+			const before = sessionGrants.size;
+			if (sessionId === '') sessionGrants.clear();
+			else sessionGrants.delete(sessionId);
+			writeJson(response, 200, {
+				ok: true,
+				revoked: before - sessionGrants.size,
+				grants: grantList(),
 			});
 		} catch (error) {
 			writeJson(response, 500, { ok: false, error: error?.message ?? String(error) });
@@ -708,7 +1024,7 @@ function registerRoutes(ctx, wiring) {
 	});
 
 	return () => {
-		for (const off of [onState, onSettings]) {
+		for (const off of [onState, onSettings, onConsent]) {
 			if (typeof off === 'function') {
 				try {
 					off();
@@ -787,6 +1103,8 @@ function apply(ctx, config = {}) {
 		refreshing: false,
 		offTools: null,
 		registeredTools: [],
+		/** 惰性解析出的 userQuestions 服务；null = 还没解析成功过。 */
+		userQuestions: null,
 	};
 
 	const offRoutes = registerRoutes(ctx, wiring);
@@ -812,6 +1130,8 @@ function apply(ctx, config = {}) {
 			}
 		}
 		imageCache.clear();
+		// 会话授权也一起丢掉：插件卸载/重载后重新开始问，不留一份没人看着的鼠标键盘许可。
+		sessionGrants.clear();
 	};
 	if (typeof ctx.effect === 'function') {
 		ctx.effect(() => () => stop(), `${pkg}: mount`);
@@ -820,5 +1140,38 @@ function apply(ctx, config = {}) {
 	}
 }
 
-export { DEFAULTS as CONFIG_DEFAULTS, DEFAULTS, FileStore, apply, buildState, inject, isAdmitted, isExcludedTitle, name, pkg, registerRoutes, registerTools, resolveSettings, stateDirectory, toolNames };
+export {
+	CONFIRM_TIMEOUT_MS,
+	CONFIRM_TOOLS,
+	CONSENT_ALLOW_ONCE,
+	CONSENT_ALLOW_SESSION,
+	CONSENT_DENY,
+	CONSENT_PATH,
+	CONSENT_QUESTION_ID,
+	DEFAULTS,
+	DEFAULTS as CONFIG_DEFAULTS,
+	FileStore,
+	VERSION,
+	apply,
+	buildState,
+	describeInputCall,
+	grantList,
+	inject,
+	inputTimeoutMs,
+	isAdmitted,
+	isExcludedTitle,
+	isSessionGranted,
+	name,
+	pkg,
+	readConsentChoice,
+	registerRoutes,
+	registerTools,
+	requestInputConsent,
+	resolveSettings,
+	resolveUserQuestions,
+	sessionGrants,
+	stateDirectory,
+	toolNames,
+	withConsent,
+};
 
