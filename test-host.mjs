@@ -15,10 +15,12 @@ const {
 	CONSENT_ALLOW_SESSION,
 	CONSENT_DENY,
 	FileStore,
+	describeGrantGap,
+	grantList,
+	shortSessionId,
 	VERSION,
 	apply,
 	describeInputCall,
-	grantList,
 	inject,
 	isAdmitted,
 	isExcludedTitle,
@@ -443,6 +445,47 @@ console.log("\n[10] 操作前征求同意");
 		await assert.rejects(() => wired({ text: "x" }, execFor({ id: "child-1" })), /无法向人类征求同意/);
 		assert.equal(ran, 0);
 		ok("ask() 抛错（子智能体 / 无 answerer）→ 拒绝且不执行");
+	}
+
+	// ── 会话 id 的展示短名：真机验证时测出来的 bug ──
+	{
+		// 真实会话 id 形如 session-<uuid>。直接截前 8 位只会得到 "session-" 这个
+		// 每条都一样的固定前缀，面板上所有授权会显示成同一个东西 —— 这是在真机上
+		// 看到的（面板显示 "session-…"，分不清哪条是哪条）。
+		assert.equal(shortSessionId("session-85555e38-17f8-4cd3-8a4a-9d13c88315a9"), "85555e38");
+		// 子智能体的会话 id 没有前缀（实测如此），要原样取前 8 位
+		assert.equal(shortSessionId("83fe953e-3768-41d1-b699-15786868584f"), "83fe953e");
+		assert.equal(shortSessionId("abcdef1234567890"), "abcdef12");
+		assert.equal(shortSessionId(""), "");
+		assert.equal(shortSessionId(undefined), "");
+		ok("shortSessionId：剥掉 session- 前缀再截，两种真实形状都能区分");
+
+		sessionGrants.clear();
+		sessionGrants.set("session-85555e38-17f8-4cd3-8a4a-9d13c88315a9", { at: Date.now() });
+		assert.equal(grantList()[0].short, "85555e38");
+		assert.notEqual(grantList()[0].short, "session-", "短名绝不能只是那个固定前缀");
+		ok("grantList 用短名展示授权");
+	}
+
+	// ── 问不到人时的提示必须指向**父会话**，而不是子会话 ──
+	{
+		// 真机实测：子智能体收到的原文写着「会话 83fe953e 还没拿到授权」，
+		// 但该去授权的是父会话 —— 照着这句话行动会走错方向。
+		const childGap = describeGrantGap(
+			"83fe953e-3768-41d1-b699-15786868584f",
+			"session-85555e38-17f8-4cd3-8a4a-9d13c88315a9"
+		);
+		assert.match(childGap, /83fe953e/, "要点明子会话");
+		assert.match(childGap, /85555e38/, "更要紧的是点明父会话");
+		assert.match(childGap, /在主会话里授权/, "要给出可操作的出路");
+		assert.doesNotMatch(childGap, /session-…/, "不该出现无区分度的前缀");
+
+		const selfGap = describeGrantGap("session-85555e38-17f8-4cd3-8a4a-9d13c88315a9", "");
+		assert.match(selfGap, /85555e38/);
+		assert.doesNotMatch(selfGap, /父会话/, "没有父会话时不该提父会话");
+
+		assert.match(describeGrantGap("", ""), /没有会话身份/);
+		ok("describeGrantGap：子智能体的提示指向父会话并给出出路");
 	}
 
 	// ── readConsentChoice 直接驱动 ──

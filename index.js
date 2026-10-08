@@ -365,6 +365,26 @@ function describeInputCall(toolName, args) {
 }
 
 /**
+ * 问不到人时给模型的一句**可操作**说明。
+ *
+ * 子智能体自己弹不出窗，它唯一的出路是主会话先授权 —— 所以这句话必须点明
+ * 「该去哪个会话授权」。早先只写「会话 <子会话> 没拿到授权」，其实是误导：
+ * 照着它去给子会话授权是没用的（授权由人点，子智能体根本弹不出窗）。
+ * @param {string} sessionId - 当前调用的会话 id。
+ * @param {string} parentId - 它的父会话 id（非子智能体时为空）。
+ * @returns {string}
+ */
+function describeGrantGap(sessionId, parentId) {
+	if (sessionId === '') return ' 这次调用没有会话身份，拿不到已有授权，因此不执行。';
+	if (parentId === '') {
+		return ` 会话 ${shortSessionId(sessionId)} 还没拿到「${CONSENT_ALLOW_SESSION}」授权。`;
+	}
+	return ` 会话 ${shortSessionId(sessionId)} 与它的父会话 ${shortSessionId(parentId)} 都没有` +
+		`「${CONSENT_ALLOW_SESSION}」授权，而子智能体自己弹不出窗问人 —— ` +
+		'需要用户在主会话里授权，子智能体才能跟着用。';
+}
+
+/**
  * 征求一次同意，返回是否放行。
  *
  * 用 `ctx.userQuestions` 而不是 DSH 原生的 `ctx.approval`：原生那套的结果词汇表是
@@ -377,6 +397,9 @@ async function requestInputConsent(wiring, exec, toolName, args) {
 	const header = exec?.agent?.session?.header;
 	if (isSessionGranted(header)) return { ok: true, via: 'session' };
 	const sessionId = header === undefined || header.id === undefined ? '' : String(header.id);
+	const parentId = header?.parentSession === undefined || header.parentSession === null
+		? ''
+		: String(header.parentSession);
 
 	const userQuestions = resolveUserQuestions(wiring);
 	if (userQuestions === null) {
@@ -414,12 +437,8 @@ async function requestInputConsent(wiring, exec, toolName, args) {
 		const reason = error?.message ?? String(error);
 		return {
 			ok: false,
-			error:
-				`${toolName} 被拒绝：无法向人类征求同意（${reason}）。` +
-				(sessionId === ''
-					? ''
-					: ` 会话 ${sessionId.slice(0, 8)} 还没拿到「${CONSENT_ALLOW_SESSION}」授权，` +
-						'而子智能体自己弹不出窗问人。'),
+			error: `${toolName} 被拒绝：无法向人类征求同意（${reason}）。` +
+				describeGrantGap(sessionId, parentId),
 		};
 	}
 
@@ -887,10 +906,28 @@ function toolNames(settings) {
 	return names;
 }
 
+/**
+ * 会话 id 的展示用短名。
+ *
+ * 真实会话 id 形如 `session-85555e38-17f8-4cd3-8a4a-9d13c88315a9`，
+ * 所以**不能直接截前 8 位** —— 那只会得到 `session-` 这个每条都一样的固定前缀，
+ * 面板上所有授权会显示成同一个东西。（这个 bug 是在真机上测出来的：
+ * 面板显示 "session-…"，根本分不清哪条是哪条。）
+ * 先剥掉前缀再截，才有区分度。
+ * @param {string} id - 会话 id。
+ * @returns {string} 适合面板展示的短名。
+ */
+function shortSessionId(id) {
+	const text = String(id ?? '');
+	const prefix = 'session-';
+	const tail = text.startsWith(prefix) ? text.slice(prefix.length) : text;
+	return tail.slice(0, 8);
+}
+
 /** 会话授权的可序列化视图，最新在前。 */
 function grantList() {
 	return [...sessionGrants.entries()]
-		.map(([id, meta]) => ({ id, short: id.slice(0, 8), at: meta.at }))
+		.map(([id, meta]) => ({ id, short: shortSessionId(id), at: meta.at }))
 		.sort((left, right) => right.at - left.at);
 }
 
@@ -1148,6 +1185,7 @@ export {
 	apply,
 	buildState,
 	describeInputCall,
+	describeGrantGap,
 	grantList,
 	inject,
 	inputTimeoutMs,
@@ -1163,6 +1201,7 @@ export {
 	resolveSettings,
 	resolveUserQuestions,
 	sessionGrants,
+	shortSessionId,
 	stateDirectory,
 	toolNames,
 	withConsent,

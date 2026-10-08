@@ -313,7 +313,7 @@ dsh-bundle-screen-view/
 
 ```bash
 npm run check     # syntax-check all five files
-npm test          # 51 host assertion groups + 28 client assertion groups
+npm test          # 54 host assertion groups + 28 client assertion groups
 ```
 
 The tests cover config normalisation, the four safety gates, window exclusion, the sparse override

@@ -298,7 +298,7 @@ dsh-bundle-screen-view/
 
 ```bash
 npm run check     # 五个文件的语法检查
-npm test          # 宿主 51 项断言组 + 客户端 28 项断言组
+npm test          # 宿主 54 项断言组 + 客户端 28 项断言组
 ```
 
 测试覆盖了配置归一化、四道安全闸门、窗口排除、状态覆盖层、面板路由（含 `/consent` 撤销），
